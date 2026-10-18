@@ -1,0 +1,36 @@
+# Base Spark with standard platform jars and Python runtime dependencies,
+# but ZERO StreamWright packages installed (no core, no spark, no connectors, no job code).
+ARG BASE=apache/spark:3.5.3-scala2.12-java17-python3-ubuntu@sha256:a1f2c9dcecb36c0f5c342be340b368883cfaa1d7ab23e6e222c8a93157b73a74
+FROM ${BASE}
+
+USER root
+RUN python3 -m pip --version || (apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*)
+
+ARG SPARK_VERSION=3.5.3
+ARG DELTA_VERSION=3.2.1
+ARG PG_JDBC_VERSION=42.7.4
+ARG HADOOP_AWS_VERSION=3.3.4
+ARG AWS_SDK_BUNDLE_VERSION=1.12.262
+ARG MAVEN=https://repo1.maven.org/maven2
+
+RUN set -eux; \
+    cd /opt/spark/jars; \
+    fetch() { \
+      url="$1"; file="$(basename "$url")"; \
+      curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 -o "$file" "$url"; \
+      echo "$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 "$url.sha1")  $file" | sha1sum -c -; \
+    }; \
+    fetch "$MAVEN/io/delta/delta-spark_2.12/${DELTA_VERSION}/delta-spark_2.12-${DELTA_VERSION}.jar"; \
+    fetch "$MAVEN/io/delta/delta-storage/${DELTA_VERSION}/delta-storage-${DELTA_VERSION}.jar"; \
+    fetch "$MAVEN/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar"; \
+    fetch "$MAVEN/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar"; \
+    fetch "$MAVEN/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+
+# Python prerequisites for data clients (pure libraries, NO streamwright)
+RUN set -eux; \
+    python3 -m pip install --no-cache-dir --upgrade "pip>=24" "setuptools>=70" wheel; \
+    python3 -m pip install --no-cache-dir pyyaml requests "psycopg[binary]>=3.1" boto3 confluent-kafka duckdb pytz
+
+USER 185
+WORKDIR /work
+ENTRYPOINT ["/opt/spark/bin/spark-submit"]

@@ -1,0 +1,340 @@
+# ==============================================================================
+# Pipeline: Multi-Client Bronze Lakehouse Ingestion & Partitioned Distribution
+# Engine:   StreamWright Spark (Distributed Batch Processing)
+# Target:   AWS EMR on EC2 / EMR Serverless with Delta Lake & AWS MSK
+# ==============================================================================
+#
+# Production Design Principles Illustrated:
+# 1. DYNAMIC CONFIGURATION & SCHEMA MAPPING:
+#    Loads active column mappings and canonical vocabulary dynamically from a
+#    relational metadata database (Postgres `config_db`). This allows onboarding
+#    new clients and headers without code deployment or job restarts.
+#
+# 2. DELTA LAKE MERGE OPTIMIZATION (TARGET PREDICATE PRUNING):
+#    When merging micro-batches into large partitioned Delta tables, standard
+#    `target.id = source.id` conditions scan all partition files.
+#    `target_predicate: "target.event_date IN ({{ tagged_orders.event_date }})"`
+#    evaluates the distinct partition dates from the incoming batch and prunes
+#    Delta files on S3 before the merge, cutting I/O by over 95%.
+#
+# 3. MULTI-TENANT SPLIT FILE EXPORTS:
+#    Partitioned client deliveries are generated directly from the distributed
+#    Spark DataFrame via `split_by: [client_id, event_date]`, formatting clean
+#    compressed files like `{client_id}_{event_date}_orders.csv.gz`.
+#
+# 4. DOWNSTREAM OUTBOX PUBLISHING:
+#    Notifies silver/gold downstream processing pipelines by publishing commit
+#    metadata to Kafka (`lake.bronze.committed.v1`) using the atomic `_commits`
+#    view. The message includes the exact Delta version and row counts.
+# ==============================================================================
+
+kind: SparkJob
+version: 1
+name: bronze_client_orders
+description: Ingests per-client order files announced via Kafka, applies dynamic schema harmonization, merges into Delta Bronze with partition pruning, exports client delivery archives, and announces commit metadata.
+
+spec:
+  # Configuration parameters injected via CLI or environment overlays
+  config:
+    kafka_bootstrap: {type: string}
+    lake_bucket:     {type: string}
+  # Secrets fetched securely by the driver using the instance profile / IAM role
+  secrets:
+    ops_db_password:       {type: string}
+    config_db_password:    {type: string}
+    reporting_db_password: {type: string}
+
+connections:
+  # ----------------------------------------------------------------------------
+  # Kafka Bus: Enterprise message broker with AWS MSK IAM SASL_SSL authentication
+  # ----------------------------------------------------------------------------
+  bus:
+    provider: kafka
+    bootstrap_servers: "{{ config.kafka_bootstrap }}"
+    security_protocol: SASL_SSL
+    sasl_mechanism: AWS_MSK_IAM
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Landing Storage: Raw client delivery drop-zone in Amazon S3
+  # ----------------------------------------------------------------------------
+  landing:
+    provider: s3
+    roots: ["s3://acme-landing/"]
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Lake Storage: Clean data lake bucket
+  # ----------------------------------------------------------------------------
+  lake:
+    provider: s3
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Delta Lake: Analytical ACID table storage (inherits AWS S3 credentials from `lake`)
+  # ----------------------------------------------------------------------------
+  lake_delta:
+    provider: deltalake
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    storage: lake
+
+  # ----------------------------------------------------------------------------
+  # Config DB: Metadata store holding per-client column mappings and canonical names
+  # ----------------------------------------------------------------------------
+  config_db:
+    provider: postgres
+    host: cfg.internal.net
+    database: config
+    user: sw_reader
+    password: "{{ secrets.config_db_password }}"
+    sslmode: require
+
+  # ----------------------------------------------------------------------------
+  # Reporting DB: Ingestion auditing, metrics, and data governance ledger
+  # ----------------------------------------------------------------------------
+  reporting_db:
+    provider: postgres
+    host: rep.internal.net
+    database: reporting
+    user: sw_writer
+    password: "{{ secrets.reporting_db_password }}"
+    sslmode: require
+
+  # ----------------------------------------------------------------------------
+  # Ops DB: Streamwright control plane for distributed lock leases & batch state
+  # ----------------------------------------------------------------------------
+  ops_db:
+    provider: postgres
+    host: ops.internal.net
+    database: ops
+    user: sw_state
+    password: "{{ secrets.ops_db_password }}"
+    sslmode: require
+
+steps:
+  # ============================================================================
+  # STEP 1: Query client column mappings from Postgres metadata
+  # ============================================================================
+  - name: client_columns
+    connection: config_db
+    service: database
+    method: query
+    arguments:
+      query: "SELECT prefix, header, canonical, type, required FROM ingest.column_mappings WHERE dataset = 'orders' AND active"
+
+  # ============================================================================
+  # STEP 2: Query canonical target schema vocabulary
+  # ============================================================================
+  - name: canonical_columns
+    connection: config_db
+    service: database
+    method: query
+    arguments:
+      query: "SELECT name, type FROM ingest.canonical_columns WHERE dataset = 'orders'"
+
+  # ============================================================================
+  # STEP 3: Consume file arrival announcements from Kafka
+  # Standard vendor arguments: group.id, auto.offset.reset, max.poll.records
+  # ============================================================================
+  - name: arrivals
+    connection: bus
+    service: topic
+    method: consume
+    arguments:
+      topic: lake.file_arrived.v1
+      group.id: streamwright-bronze-client-orders
+      auto.offset.reset: earliest
+      max.poll.records: 500
+      max_wait: 30s
+    sql: |
+      SELECT
+        p.message_id,
+        p.client_id,
+        p.file_uri,
+        CASE
+          WHEN p.file_uri IS NULL THEN 'missing file_uri'
+          WHEN count(m.prefix) = 0 THEN 'no column mapping registered for path'
+        END AS _error
+      FROM (
+        SELECT
+          message_id,
+          j.client_id AS client_id,
+          j.file_uri AS file_uri
+        FROM (
+          SELECT message_id, from_json(body, 'client_id STRING, file_uri STRING') AS j
+          FROM input
+        )
+      ) p
+      LEFT JOIN client_columns m ON startswith(p.file_uri, m.prefix)
+      GROUP BY p.message_id, p.client_id, p.file_uri
+
+  # ============================================================================
+  # STEP 4: Filter valid arrivals
+  # ============================================================================
+  - name: valid_arrivals
+    sql: "SELECT * FROM arrivals WHERE _error IS NULL"
+
+  # ============================================================================
+  # STEP 5: Dynamic S3 object reads with dynamic column projection & harmonizing
+  # Reads raw CSVs using path references `{{ valid_arrivals.file_uri }}`.
+  # Automatically renames client-specific headers to canonical columns.
+  # ============================================================================
+  - name: orders
+    connection: landing
+    service: object
+    method: read
+    arguments:
+      path: "{{ valid_arrivals.file_uri }}"
+      format: csv
+      options:
+        header: true
+      columns: "{{ client_columns }}"
+      vocabulary: "{{ canonical_columns }}"
+      on_mismatch: skip
+
+  # ============================================================================
+  # STEP 6: Tag orders with batch metadata & partition date
+  # Persisted to memory and disk because this DataFrame feeds 3 separate outputs:
+  # Delta table merge, client gzip CSV exports, and ingest audit metrics.
+  # ============================================================================
+  - name: tagged_orders
+    persist: memory_and_disk
+    sql: |
+      SELECT
+        a.client_id,
+        o.*,
+        CAST(o.event_ts AS DATE) AS event_date,
+        :batch_id AS _batch_id
+      FROM orders o
+      JOIN (
+        SELECT DISTINCT file_uri, client_id
+        FROM valid_arrivals
+      ) a ON o._source_file = a.file_uri
+
+outputs:
+  # ============================================================================
+  # OUTPUT 1: Delta Lake Merge with Dynamic Partition Pruning
+  # Uses target_predicate to limit scan range to incoming partition dates only!
+  # ============================================================================
+  - name: bronze_orders
+    connection: lake_delta
+    service: tables
+    method: merge
+    arguments:
+      table_path: "s3://{{ config.lake_bucket }}/bronze/orders"
+      partition_by: [event_date]
+      condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
+      target_predicate: "target.event_date IN ({{ tagged_orders.event_date }})"
+      when_matched:
+        - action: update
+          set:
+            event_date: source.event_date
+            _batch_id: source._batch_id
+      when_not_matched: [{action: insert}]
+    sql: "SELECT * FROM tagged_orders"
+
+  # ============================================================================
+  # OUTPUT 2: Quarantine Invalid Records / Mapping Mismatches
+  # Captures unparseable messages and records missing metadata into rejects table.
+  # ============================================================================
+  - name: bronze_rejects
+    connection: lake_delta
+    service: tables
+    method: append
+    arguments:
+      table_path: "s3://{{ config.lake_bucket }}/bronze/rejects"
+    sql: |
+      SELECT message_id, file_uri AS path, _error AS reason, :batch_id AS batch_id
+      FROM arrivals
+      WHERE _error IS NOT NULL
+      UNION ALL
+      SELECT CAST(NULL AS STRING), path, reason, :batch_id
+      FROM _file_errors
+
+  # ============================================================================
+  # OUTPUT 3: Generate Per-Client Daily Gzip CSV Exports
+  # Automatically splits partitions into clean, organized S3 paths:
+  # s3://.../exports/orders/{client_id}/dt={event_date}/{client_id}_{event_date}_orders.csv.gz
+  # ============================================================================
+  - name: client_exports
+    connection: lake
+    service: object
+    method: write
+    arguments:
+      path: "s3://{{ config.lake_bucket }}/exports/orders/"
+      format: csv
+      mode: overwrite
+      options:
+        header: true
+        compression: gzip
+      split_by: [client_id, event_date]
+      layout: "{client_id}/dt={event_date:%Y-%m-%d}"
+      file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
+      max_splits: 500
+    sql: "SELECT client_id, event_date, event_ts, amo_id, revenue FROM tagged_orders"
+
+  # ============================================================================
+  # OUTPUT 4: Upsert Batch Metrics into Operational Ingest Audit Ledger
+  # ============================================================================
+  - name: ingest_audit
+    connection: reporting_db
+    service: database
+    method: upsert
+    arguments:
+      table: reporting.ingest_audit
+      key: [batch_id, client_id]
+      update: [row_count, revenue]
+      staging_table: reporting.ingest_audit_stg
+    sql: |
+      SELECT
+        :batch_id AS batch_id,
+        client_id,
+        count(*) AS row_count,
+        sum(revenue) AS revenue
+      FROM tagged_orders
+      GROUP BY client_id
+
+  # ============================================================================
+  # OUTPUT 5: Publish Outbox Announcement Event to Kafka
+  # Emits the exact Delta Lake commit version and row counts from `_commits`.
+  # Downstream Silver/Gold DAGs consume this event to trigger next-hop workflows.
+  # ============================================================================
+  - name: announce
+    connection: bus
+    service: topic
+    method: publish
+    arguments:
+      topic: lake.bronze.committed.v1
+      key: table_name
+    sql: "SELECT table_name, version, rows, batch_id FROM _commits WHERE output = 'bronze_orders'"
+
+runtime:
+  state:
+    connection: ops_db
+    schema: sw_ops
+  secrets:
+    source: aws_secretsmanager
+    id: streamwright/bronze_client_orders
+  limits:
+    reference_values: 10000
+    read_groups: 200
+  spark:
+    version: "3.5.x"
+    app_name: bronze_client_orders
+    conf:
+      spark.executor.memory: 10g
+      spark.executor.cores: "4"
+      spark.dynamicAllocation.enabled: "true"
+      spark.dynamicAllocation.maxExecutors: "40"
+      spark.sql.adaptive.enabled: "true"
+      spark.sql.session.timeZone: UTC
+  platform:
+    type: emr_ec2
+    region: us-east-1
+    cluster:
+      id: j-2AB3CDEF45GH6
+    deploy_mode: cluster
+    staging: s3://acme-artifacts/streamwright/
+  artifacts:
+    lock: ./locks/bronze_client_orders.lock.json

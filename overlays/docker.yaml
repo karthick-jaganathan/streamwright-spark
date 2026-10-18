@@ -1,0 +1,71 @@
+# ==============================================================================
+# Docker Compose Overlay for Local Development & Testing
+# ==============================================================================
+# Usage:
+#   docker compose up -d --wait
+#   sw spark validate examples/s3_events_to_delta --overlay overlays/docker.yaml --strict
+#   sw spark run examples/s3_events_to_delta --overlay overlays/docker.yaml \
+#       --set kafka_bootstrap=kafka:9092 --set lake_bucket=acme-lake --once
+# ==============================================================================
+
+connections:
+  # Route Kafka bus to local plaintext Docker container on kafka:9092
+  bus:
+    security_protocol: PLAINTEXT
+    sasl_mechanism: null
+    region: null
+
+  # Route S3 landing & lake storage to LocalStack on localstack:4566
+  landing:
+    endpoint: "localstack:4566"
+    url_style: path
+    use_ssl: false
+    key_id: "{{ secrets.s3_key_id }}"
+    secret: "{{ secrets.s3_secret }}"
+
+  lake:
+    endpoint: "localstack:4566"
+    url_style: path
+    use_ssl: false
+    key_id: "{{ secrets.s3_key_id }}"
+    secret: "{{ secrets.s3_secret }}"
+
+  lake_delta: {}
+
+  # Route PostgreSQL reporting and ops database to local postgres container
+  reporting_db:
+    host: postgres
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+  ops_db:
+    host: postgres
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+spec:
+  secrets:
+    s3_key_id: {type: string}
+    s3_secret: {type: string}
+
+runtime:
+  # Secrets sourced from STREAMWRIGHT_SECRET_* environment variables instead of AWS Secrets Manager
+  secrets: null
+  artifacts: null
+  platform:
+    type: local
+    region: null
+    cluster: null
+    deploy_mode: null
+    staging: null
+  spark:
+    conf:
+      spark.checkpoint.dir: "/tmp/spark_checkpoints"
+      spark.dynamicAllocation.enabled: "false"
+      spark.dynamicAllocation.maxExecutors: null
+      spark.executor.memory: 2g
+      spark.executor.cores: "2"
+      spark.sql.catalogImplementation: "hive"
+      spark.hadoop.hive.metastore.uris: "thrift://metastore:9083"

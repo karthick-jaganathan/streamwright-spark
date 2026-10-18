@@ -1,0 +1,396 @@
+# ==============================================================================
+# Pipeline: S3 Event-Driven Ingestion to Delta Lake with Two-Phase Bookkeeping
+# Engine:   StreamWright Spark (Distributed Batch Processing)
+# Pattern:  Kafka Event Notification -> Bookkeeping Init (PROCESSING)
+#           -> Lazy S3 Read -> Lineage Checkpoint -> Delta MERGE (Partition Pruned)
+#           -> Multi-Client Split Exports -> Bookkeeping Done (COMPLETED) -> Outbox
+# ==============================================================================
+#
+# Execution Lifecycle & DAG Optimization Invariants:
+# ------------------------------------------------------------------------------
+# 1. LAZY DAG DEFINITION:
+#    Steps 1-5 declare Spark SQL transformations and views. Spark builds an execution
+#    graph without reading S3 data or writing to Delta.
+#
+# 2. OUTPUT 1: BOOKKEEPING INITIALIZATION (Zero Heavy I/O):
+#    Inserts initial audit records with status = 'PROCESSING' into PostgreSQL.
+#    Because Spark evaluates lazily, Output 1 only evaluates the Kafka event metadata
+#    lineage (file_arrivals -> parsed_file_events -> distinct_files).
+#    S3 files are NOT opened or read during this step!
+#
+# 3. SPARK DAG LINEAGE CHECKPOINT (`checkpoint: true`):
+#    `processed_orders` cuts upstream Catalyst query plans to physical storage
+#    (`spark.checkpoint.dir`), severing recursive RDD lineages and preventing JVM
+#    StackOverflowError during subsequent fan-out to multiple outputs.
+#
+# 4. OUTPUT 2: DELTA LAKE MERGE WITH TARGET PREDICATE PRUNING:
+#    Merges records into partitioned Delta table.
+#    `target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"`
+#    evaluates the distinct partition dates from the batch and limits Delta's file
+#    scan strictly to matching S3 directories, eliminating >95% of S3 I/O.
+#    Produces an atomic commit receipt in the internal `_commits` view.
+#
+# 5. OUTPUT 3: MULTI-CLIENT SPLIT FILE EXPORTS:
+#    Streams partitioned, gzip-compressed CSV exports (`split_by: [client_id, event_date]`)
+#    directly to S3 in a single pass without extra shuffle stages.
+#
+# 6. OUTPUT 4: BOOKKEEPING COMPLETION (Zero Redundant Reads):
+#    Updates the audit record to status = 'COMPLETED', attaching exact row counts and
+#    the Delta commit version retrieved directly from `_commits`.
+#    Zero extra reads against S3 or Delta Lake!
+#
+# 7. OUTPUT 5: DOWNSTREAM OUTBOX PUBLISHING:
+#    Emits batch completion event to Kafka (`lake.orders.committed.v1`).
+#
+# 8. BROKER OFFSET COMMIT:
+#    Kafka consumer offsets commit to the broker ONLY after all outputs and the
+#    outbox successfully land.
+# ==============================================================================
+
+kind: SparkJob
+version: 1
+name: s3_events_to_delta
+description: Consumes S3 file arrival notifications from Kafka, logs initial audit state, ingests raw files, merges into Delta Lake with partition pruning, exports client archives, updates audit records with commit receipts, and publishes outbox notifications.
+
+spec:
+  config:
+    kafka_bootstrap: {type: string}
+    lake_bucket:     {type: string}
+  secrets:
+    ops_db_password:       {type: string}
+    reporting_db_password: {type: string}
+    aws_access_key_id:     {type: string}
+    aws_secret_access_key: {type: string}
+
+connections:
+  # ----------------------------------------------------------------------------
+  # Kafka Bus: Receives S3 ObjectCreated events & publishes outbox announcements
+  # ----------------------------------------------------------------------------
+  bus:
+    provider: kafka
+    bootstrap_servers: "{{ config.kafka_bootstrap }}"
+    security_protocol: SASL_SSL
+    sasl_mechanism: AWS_MSK_IAM
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Landing S3 Bucket: Raw incoming data drop-zone
+  # ----------------------------------------------------------------------------
+  landing:
+    provider: s3
+    roots: ["s3://acme-landing/"]
+    region: us-east-1
+    key_id: "{{ secrets.aws_access_key_id }}"
+    secret: "{{ secrets.aws_secret_access_key }}"
+
+  # ----------------------------------------------------------------------------
+  # Lake S3 Bucket: Storage backing Delta tables and split export archives
+  # ----------------------------------------------------------------------------
+  lake:
+    provider: s3
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    region: us-east-1
+    key_id: "{{ secrets.aws_access_key_id }}"
+    secret: "{{ secrets.aws_secret_access_key }}"
+
+  # ----------------------------------------------------------------------------
+  # Delta Lake: Analytical ACID table storage (inherits credentials from lake)
+  # ----------------------------------------------------------------------------
+  lake_delta:
+    provider: deltalake
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    storage: lake
+    schema: analytics
+    schema_location: "s3://{{ config.lake_bucket }}/analytics/"
+    schema_comment: "Central enterprise analytics data mart for orders and reporting"
+
+  # ----------------------------------------------------------------------------
+  # Reporting DB: Relational database holding operational bookkeeping & audit tables
+  # ----------------------------------------------------------------------------
+  reporting_db:
+    provider: postgres
+    host: rep.internal.net
+    database: reporting
+    user: sw_writer
+    password: "{{ secrets.reporting_db_password }}"
+    sslmode: require
+
+  # ----------------------------------------------------------------------------
+  # Ops DB: Streamwright control plane for distributed leases & batch state
+  # ----------------------------------------------------------------------------
+  ops_db:
+    provider: postgres
+    host: ops.internal.net
+    database: ops
+    user: sw_state
+    password: "{{ secrets.ops_db_password }}"
+    sslmode: require
+
+steps:
+  # ============================================================================
+  # STEP 1: Consume S3 file notification events from Kafka
+  # Uses standard vendor keys: group.id, auto.offset.reset, max.poll.records
+  # ============================================================================
+  - name: file_arrivals
+    connection: bus
+    service: topic
+    method: consume
+    arguments:
+      topic: lake.s3_file_events.v1
+      group.id: streamwright-s3-events-to-delta
+      auto.offset.reset: earliest
+      max.poll.records: 500
+      max_wait: 10s
+
+  # ============================================================================
+  # STEP 2: Extract file URIs and client metadata from message payload
+  # ============================================================================
+  - name: parsed_file_events
+    sql: |
+      SELECT
+        message_id,
+        j.file_uri,
+        j.client_id,
+        :batch_id AS batch_id
+      FROM (
+        SELECT
+          message_id,
+          from_json(body, 'file_uri STRING, client_id STRING') AS j
+        FROM input
+      )
+
+  # ============================================================================
+  # STEP 3: Deduplicate file URIs across the batch
+  # Persisted to memory and disk so Output 1 (init) and Output 4 (complete) share
+  # the evaluated metadata without re-reading Kafka.
+  # ============================================================================
+  - name: distinct_files
+    persist: memory_and_disk
+    sql: |
+      SELECT
+        file_uri,
+        any_value(client_id) AS client_id,
+        :batch_id AS batch_id
+      FROM parsed_file_events
+      GROUP BY file_uri
+
+  # ============================================================================
+  # STEP 4: Read raw file contents from S3 based on Kafka event URIs
+  # Dynamically loads paths: `{{ distinct_files.file_uri }}`.
+  # This view is strictly lazy—S3 files are NOT opened until Output 2 runs!
+  # ============================================================================
+  - name: file_contents
+    connection: landing
+    service: object
+    method: read
+    arguments:
+      path: "{{ distinct_files.file_uri }}"
+      format: csv
+      options:
+        header: true
+
+  # ============================================================================
+  # STEP 5: Business Transformation & Lineage Checkpointing
+  # ----------------------------------------------------------------------------
+  # - Calculates taxes, totals, and extracts source file names.
+  # - `checkpoint: true` truncates upstream Spark Catalyst query plans to physical
+  #   storage (`spark.checkpoint.dir`), severing recursive RDD lineages.
+  # - `persist: memory_and_disk` caches the records in memory for fast reuse across
+  #   Delta merge (Output 2), split exports (Output 3), and audit (Output 4).
+  # ============================================================================
+  - name: processed_orders
+    checkpoint: true
+    persist: memory_and_disk
+    sql: |
+      SELECT
+        f.order_id,
+        f.client_id,
+        f.item_name,
+        CAST(f.amount AS DOUBLE) AS amount,
+        ROUND(CAST(f.amount AS DOUBLE) * 0.08, 2) AS tax,
+        ROUND(CAST(f.amount AS DOUBLE) * 1.08, 2) AS total_amount,
+        CAST(f.event_ts AS TIMESTAMP) AS event_ts,
+        CAST(f.event_ts AS DATE) AS event_date,
+        input_file_name() AS source_file,
+        :batch_id AS batch_id
+      FROM file_contents f
+
+outputs:
+  # ============================================================================
+  # OUTPUT 1: Register Initial Bookkeeping Status (status = 'PROCESSING')
+  # ----------------------------------------------------------------------------
+  # Eager Action #1:
+  # Inserts/updates audit records for each discovered file into PostgreSQL.
+  # Spark evaluates ONLY `distinct_files` (Kafka metadata). S3 data files are
+  # NOT opened or read here. If the cluster crashes during Step 4/5, these audit
+  # records provide immediate operational visibility into in-flight batches.
+  # ============================================================================
+  - name: bookkeeping_files_received
+    connection: reporting_db
+    service: database
+    method: upsert
+    arguments:
+      table: reporting.file_event_audit
+      key: [file_uri]
+      update: [client_id, status, batch_id, received_at]
+      staging_table: reporting.file_event_audit_stg
+    sql: |
+      SELECT
+        file_uri,
+        client_id,
+        'PROCESSING' AS status,
+        batch_id,
+        current_timestamp() AS received_at
+      FROM distinct_files
+
+  # ============================================================================
+  # OUTPUT 2: Delta Lake MERGE with Target Predicate Partition Pruning
+  # ----------------------------------------------------------------------------
+  # Eager Action #2:
+  # Idempotently merges processed orders into the partitioned Delta Lake table.
+  # `target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"`
+  # prunes Delta historical partition files on S3, avoiding full-table scans.
+  # Generates an internal write receipt in `_commits` recording:
+  #   - output: 'delta_orders_merge'
+  #   - table_name: 's3://.../delta/orders'
+  #   - version: <Delta transaction version number>
+  #   - rows: <Number of rows modified/inserted>
+  # ============================================================================
+  - name: delta_orders_merge
+    connection: lake_delta
+    service: tables
+    method: merge
+    arguments:
+      table_path: "s3://{{ config.lake_bucket }}/delta/orders"
+      table_name: orders
+      partition_by: [event_date]
+      table_properties:
+        "delta.autoOptimize.optimizeWrite": "true"
+        "delta.autoOptimize.autoCompact": "true"
+      comment: "Consolidated e-commerce orders lakehouse table"
+      condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
+      target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
+      when_matched:
+        - action: update
+          set:
+            item_name: source.item_name
+            amount: source.amount
+            tax: source.tax
+            total_amount: source.total_amount
+            event_ts: source.event_ts
+            source_file: source.source_file
+            batch_id: source.batch_id
+      when_not_matched: [{action: insert}]
+      options:
+        mergeSchema: "true"
+    sql: "SELECT * FROM processed_orders"
+
+  # ============================================================================
+  # OUTPUT 3: Generate Per-Client Gzip CSV Split Exports
+  # ----------------------------------------------------------------------------
+  # Eager Action #3:
+  # Streams partitioned client delivery archives directly from cached DataFrame:
+  # s3://.../exports/orders/{client_id}/dt={event_date}/{client_id}_{event_date}_orders.csv.gz
+  # ============================================================================
+  - name: client_exports
+    connection: lake
+    service: object
+    method: write
+    arguments:
+      path: "s3://{{ config.lake_bucket }}/exports/orders/"
+      format: csv
+      mode: overwrite
+      on_exists: overwrite
+      options:
+        header: true
+        compression: gzip
+      split_by: [client_id, event_date]
+      layout: "{client_id}/dt={event_date:%Y-%m-%d}"
+      file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
+      max_splits: 500
+    sql: |
+      SELECT client_id, event_date, event_ts, order_id, item_name, amount, tax, total_amount
+      FROM processed_orders
+
+  # ============================================================================
+  # OUTPUT 4: Update Bookkeeping Status (status = 'COMPLETED')
+  # ----------------------------------------------------------------------------
+  # Eager Action #4:
+  # Updates the audit record with final metrics: status, per-file rows written,
+  # exact Delta commit version, and completion timestamp.
+  # - `file_rows` is aggregated in-memory from cached `processed_orders`.
+  # - `delta_version` is pulled directly from the `_commits` virtual view.
+  # ZERO extra reads are made against S3 or Delta Lake!
+  # ============================================================================
+  - name: bookkeeping_files_completed
+    connection: reporting_db
+    service: database
+    method: upsert
+    arguments:
+      table: reporting.file_event_audit
+      key: [file_uri]
+      update: [batch_id, status, rows_written, delta_version, completed_at]
+      staging_table: reporting.file_event_audit_stg
+    sql: |
+      SELECT
+        f.file_uri,
+        f.batch_id,
+        'COMPLETED' AS status,
+        COALESCE(r.file_rows, 0) AS rows_written,
+        c.version AS delta_version,
+        current_timestamp() AS completed_at
+      FROM distinct_files f
+      LEFT JOIN (
+        SELECT source_file, count(*) AS file_rows
+        FROM processed_orders
+        GROUP BY source_file
+      ) r ON endswith(r.source_file, replace(f.file_uri, 's3://acme-landing/', ''))
+      CROSS JOIN (
+        SELECT version
+        FROM _commits
+        WHERE output = 'delta_orders_merge'
+      ) c
+
+  # ============================================================================
+  # OUTPUT 5: Publish Outbox Announcement Event to Kafka
+  # ----------------------------------------------------------------------------
+  # Eager Action #5:
+  # Emits batch commit completion event to Kafka topic (`lake.orders.committed.v1`).
+  # Downstream Silver/Gold DAGs consume this event to trigger downstream workflows.
+  # ============================================================================
+  - name: announce_batch_done
+    connection: bus
+    service: topic
+    method: publish
+    arguments:
+      topic: lake.orders.committed.v1
+      key: table_name
+    sql: |
+      SELECT
+        output,
+        table_name,
+        version AS delta_version,
+        rows AS records_written,
+        batch_id
+      FROM _commits
+      WHERE output = 'delta_orders_merge'
+
+runtime:
+  # Streamwright State Store: Tracks batch leases, input watermarks, and write receipts
+  # PostgreSQL for production, or {sqlite: "/tmp/state.db"} for local dev
+  state:
+    connection: ops_db
+    schema: sw_ops
+  platform:
+    type: local
+  spark:
+    version: "3.5.x"
+    app_name: s3_events_to_delta
+    conf:
+      # Location where PySpark writes physical RDD lineage checkpoints (`checkpoint: true`)
+      spark.checkpoint.dir: "s3://{{ config.lake_bucket }}/checkpoints/spark_lineage/"
+      spark.executor.memory: 4g
+      spark.executor.cores: "2"
+      spark.sql.adaptive.enabled: "true"
+      spark.sql.session.timeZone: UTC
+      spark.sql.debug.maxToStringFields: "100"  # or "-1" for unlimited

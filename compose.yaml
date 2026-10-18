@@ -1,0 +1,123 @@
+# PROPOSED test environment (not started yet: no docker in the authoring sandbox).
+# Copy .env.example to .env first. Every port is bound to 127.0.0.1. Credentials are test-only and come from .env.
+#   docker compose up -d --wait
+#   docker compose run --rm sw validate /work/examples/s3_events_to_delta --overlay /work/overlays/docker.yaml --analyze
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: streamwright
+      POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+    volumes:
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d streamwright"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, FOWNER, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+
+  localstack:                       # S3 and SQS
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: s3,sqs
+    volumes:
+      - ./docker/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    ports: ["127.0.0.1:4566:4566"]
+    healthcheck:
+      # same check as streamwright/scripts/localstack/up.sh: a lazily loaded service reports "available", not "running"
+      test: ["CMD-SHELL", "curl -fs http://localhost:4566/_localstack/health | grep -qE '\"s3\": \"(available|running)\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    security_opt: ["no-new-privileges:true"]
+
+  kafka:                            # single-node KRaft, reachable only inside the compose network
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports: ["127.0.0.1:9094:9094"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+
+  sw:                               # Spark runs local[*] inside this container
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      additional_contexts: {streamwright: "${STREAMWRIGHT_REPO:-../streamwright}"}
+    depends_on:
+      postgres: {condition: service_healthy}
+      localstack: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+    environment:
+      STREAMWRIGHT_SECRET_OPS_DB_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_CONFIG_DB_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_REPORTING_DB_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_S3_KEY_ID: ${LOCALSTACK_KEY_ID:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_S3_SECRET: ${LOCALSTACK_SECRET:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_AWS_ACCESS_KEY_ID: ${LOCALSTACK_KEY_ID:?copy .env.example to .env}
+      STREAMWRIGHT_SECRET_AWS_SECRET_ACCESS_KEY: ${LOCALSTACK_SECRET:?copy .env.example to .env}
+    volumes:
+      - ./examples:/work/examples:ro
+      - ./overlays:/work/overlays:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    profiles: ["run"]
+
+  # --- optional profiles (see README) -----------------------------------------------------------------------
+  spark-master:
+    profiles: ["cluster"]
+    build: {context: ., dockerfile: docker/Dockerfile, additional_contexts: {streamwright: "${STREAMWRIGHT_REPO:-../streamwright}"}}
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports: ["127.0.0.1:8080:8080"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  spark-worker:
+    profiles: ["cluster"]
+    build: {context: ., dockerfile: docker/Dockerfile, additional_contexts: {streamwright: "${STREAMWRIGHT_REPO:-../streamwright}"}}
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on: [spark-master]
+    deploy: {replicas: 2}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # --- Trino + Hive Metastore for Delta Lake querying (profile: lakehouse) ------------------
+  metastore:
+    profiles: ["lakehouse"]
+    build:
+      context: .
+      dockerfile: docker/hms/Dockerfile
+    environment:
+      SERVICE_NAME: metastore
+    ports: ["127.0.0.1:9083:9083"]
+    depends_on:
+      localstack: {condition: service_healthy}
+
+  trino:
+    profiles: ["lakehouse"]
+    image: trinodb/trino:450
+    ports: ["127.0.0.1:8088:8080"]
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog:ro
+    depends_on:
+      metastore: {condition: service_started}
+      localstack: {condition: service_healthy}

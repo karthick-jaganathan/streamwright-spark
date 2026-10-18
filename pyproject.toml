@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamwright-spark"
+version = "0.0.0"
+description = "PROPOSED: Spark jobs for StreamWright (kind: SparkJob), attached as `sw spark ...`."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    {name = "Karthick Jaganathan", email = "kjaganathan.sde@gmail.com"},
+]
+keywords = ["data", "pipeline", "etl", "spark", "pyspark", "deltalake", "kafka", "sqs", "yaml", "streamwright"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.10"
+# Validation, planning, naming, the state store and the batch loop need only the standard library, PyYAML and
+# streamwright (core), so `sw spark validate` runs without Spark. The connectors themselves come from the hub:
+# `streamwright connectors install s3 postgres deltalake kafka sqs ...`. Everything else is an extra.
+dependencies = ["pyyaml==6.0.2", "streamwright~=0.1.0"]
+
+[project.urls]
+Homepage = "https://streamwright.web.app"
+Documentation = "https://streamwright.web.app/docs/"
+Repository = "https://github.com/karthick-jaganathan/streamwright-spark"
+"Issue Tracker" = "https://github.com/karthick-jaganathan/streamwright-spark/issues"
+
+[project.optional-dependencies]
+# Version ranges here are placeholders until the M0 spike fixes them; the lock file is what pins a job.
+spark    = ["pyspark>=3.5,<3.6"]
+delta    = ["delta-spark>=3.2,<3.3"]
+postgres = ["psycopg[binary]>=3.1"]
+kafka    = ["confluent-kafka>=2.4", "aws-msk-iam-sasl-signer-python>=1.0"]
+sqs      = ["boto3>=1.34"]
+emr      = ["boto3>=1.34"]
+all      = ["pyspark>=3.5,<3.6", "delta-spark>=3.2,<3.3", "psycopg[binary]>=3.1", "confluent-kafka>=2.4",
+            "aws-msk-iam-sasl-signer-python>=1.0", "boto3>=1.34"]
+
+[project.scripts]
+streamwright-spark = "streamwright.spark.cli:main"
+sw-spark = "streamwright.spark.cli:main"
+
+[project.entry-points."streamwright.spark.launchers"]
+local = "streamwright.spark.launchers.local:LocalLauncher"
+standalone = "streamwright.spark.launchers.standalone:StandaloneLauncher"
+emr_ec2 = "streamwright.spark.launchers.emr_ec2:EmrEc2Launcher"
+
+[tool.setuptools]
+# `streamwright` is a namespace package shared with streamwright (core) and its connector distributions
+package-dir = {"" = "src"}
+packages = [
+  "streamwright.spark", "streamwright.spark.cli", "streamwright.spark.contracts",
+  "streamwright.spark.engine", "streamwright.spark.job", "streamwright.spark.kinds",
+  "streamwright.spark.launchers", "streamwright.spark.plan", "streamwright.spark.runtime",
+  "streamwright.spark.state", "streamwright.spark.storage"
+]

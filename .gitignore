@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+*.lock.json.tmp
+# secrets never live in this repo (read STREAMWRIGHT_SECRET_* or --secrets FILE at run time)
+secrets*.yaml
+.env
