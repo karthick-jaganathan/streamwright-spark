@@ -1,159 +1,96 @@
-import copy
-import os
-import unittest
+"""Spark-specific rules use the shared jobs checker, loader and dependency plan."""
 
+import io
 import sys
+from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(__file__))
-import support  # noqa: E402
+import pytest
 
-support.install_entry_points()
-support.tolerate_missing_duckdb()
-
-from streamwright.spark.job import check_job, load_job, merge_overlay, resolve  # noqa: E402
-from streamwright.spark.runtime import registry  # noqa: E402
-
-EXAMPLE = os.path.join(os.path.dirname(__file__), "fixtures", "job_fixture.yaml")
-ADAPTERS = registry.load_all("adapter")[0]
-LAUNCHERS = registry.load_all("launcher")[0]
+from streamwright.core.jobs.check import check_job as check_shared
+from streamwright.core.jobs.manifest import MAX_MANIFEST_BYTES, JobError, load_job_text
+from streamwright.core.sdk.contract import Field, Operation, OperationKind
+from streamwright.spark.job import load_job, resolve
+from streamwright.spark.job.rules import SparkRules
+from streamwright.spark.launchers.common import _read_s3, resolve_job_location
 
 
-def problems_of(job):
-    return check_job(job, ADAPTERS, LAUNCHERS)[0]
+def sample_job():
+    return {
+        "kind": "SparkJob",
+        "name": "sample",
+        "spec": {"config": {"tenant": {"type": "string", "default": "acme"}}, "secrets": {"key": {"type": "string"}}},
+        "connections": {"db": {"provider": "table", "password": "{{ secrets.key }}"}},
+        "steps": [{"name": "rows", "sql": "SELECT :tenant AS id"}],
+        "outputs": [
+            {
+                "name": "result",
+                "sql": "SELECT * FROM rows",
+                "connection": "db",
+                "service": "database",
+                "method": "put",
+                "arguments": {},
+            }
+        ],
+        "runtime": {"state": {"sqlite": ":memory:"}, "spark": {"conf": {}}, "platform": {"type": "local"}},
+    }
 
 
-class Example(unittest.TestCase):
-    def setUp(self):
-        self.job = load_job(EXAMPLE)
-
-    def test_example_is_valid(self):
-        problems, warnings = check_job(self.job, ADAPTERS, LAUNCHERS)
-        self.assertEqual(problems, [])
-
-    def test_load_from_directory(self):
-        dir_path = os.path.join(os.path.dirname(__file__), "..", "examples", "s3_events_to_delta")
-        job = load_job(dir_path)
-        self.assertEqual(job["name"], "s3_events_to_delta")
-
-    def test_secret_literal_is_rejected(self):
-        job = copy.deepcopy(self.job)
-        job["connections"]["ops_db"]["password"] = "hunter2"
-        self.assertTrue(any("must be a {{ secrets.NAME }} reference" in p for p in problems_of(job)))
-
-    def test_undeclared_secret(self):
-        job = copy.deepcopy(self.job)
-        job["connections"]["ops_db"]["password"] = "{{ secrets.nope }}"
-        self.assertTrue(any("not declared" in p for p in problems_of(job)))
-
-    def test_forward_reference(self):
-        job = copy.deepcopy(self.job)
-        job["steps"][0], job["steps"][4] = job["steps"][4], job["steps"][0]
-        self.assertTrue(any("not defined before" in p for p in problems_of(job)))
-
-    def test_write_in_steps_and_read_in_outputs(self):
-        job = copy.deepcopy(self.job)
-        job["steps"].append(dict(job["outputs"][0], name="bad"))
-        self.assertTrue(any("writes; use it under outputs" in p for p in problems_of(job)))
-
-    def test_bookkeeping_connection_not_used_for_outputs(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][4]["connection"] = "ops_db"
-        self.assertTrue(any("bookkeeping" in p for p in problems_of(job)))
-
-    def test_launcher_owned_conf(self):
-        job = copy.deepcopy(self.job)
-        job["runtime"]["spark"]["conf"]["spark.jars.packages"] = "x:y:1"
-        self.assertTrue(any("owned by the launcher" in p for p in problems_of(job)))
-
-    def test_unknown_named_parameter(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][1]["sql"] = "SELECT :tenant AS t"
-        self.assertTrue(any(":tenant" in p for p in problems_of(job)))
-        job["outputs"][1]["sql"] = "SELECT '12:30' AS t, 1::int AS n, :batch_id AS b"
-        self.assertFalse(any("is not batch_id" in p for p in problems_of(job)))
-
-    def test_overwrite_needs_predicate(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][1]["method"] = "overwrite"
-        self.assertTrue(any("replace_where" in p for p in problems_of(job)))
-        job["outputs"][1]["arguments"]["replace_where"] = "client_id = 'a'"
-        self.assertFalse(any("replace_where" in p for p in problems_of(job)))
-
-    def test_merge_without_predicate_warns(self):
-        job = copy.deepcopy(self.job)
-        del job["outputs"][0]["arguments"]["target_predicate"]
-        problems, warnings = check_job(job, ADAPTERS, LAUNCHERS)
-        self.assertEqual(problems, [])
-        self.assertTrue(any("target_predicate" in w for w in warnings))
-
-    def test_split_template_errors_are_reported(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][2]["arguments"]["file_name"] = "{client_id}_{today:%Q}.csv"
-        self.assertTrue(any("unsupported directive" in p for p in problems_of(job)))
-        job["outputs"][2]["arguments"]["file_name"] = "{client_id}.csv"
-        job["outputs"][2]["arguments"]["layout"] = "{client_id}"
-        self.assertTrue(any("event_date" in p and "collide" in p for p in problems_of(job)))
-
-    def test_append_needs_batch_in_name(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][2]["arguments"]["mode"] = "append"
-        self.assertTrue(any("not replay-safe" in p for p in problems_of(job)))
-
-    def test_unknown_keys_and_arguments(self):
-        job = copy.deepcopy(self.job)
-        job["outputs"][1]["arguments"]["bogus"] = 1
-        job["outputs"][1]["colour"] = "red"
-        found = problems_of(job)
-        self.assertTrue(any("unknown 'bogus'" in p for p in found))
-        self.assertTrue(any("unknown key 'colour'" in p for p in found))
-
-    def test_persist_supports_standard_pyspark_storage_levels(self):
-        job = copy.deepcopy(self.job)
-        for level in ("MEMORY_AND_DISK_SER", "memory_only", "OFF_HEAP", "MEMORY_ONLY_2", "disk_only_2"):
-            job["steps"][-1]["persist"] = level
-            self.assertEqual(problems_of(job), [])
-
-    def test_persist_rejects_unknown_level(self):
-        job = copy.deepcopy(self.job)
-        job["steps"][-1]["persist"] = "invalid_cache_mode"
-        problems = problems_of(job)
-        self.assertTrue(any("is not a valid Spark StorageLevel" in p for p in problems), problems)
+def issues(job, definition_adapter):
+    adapter = definition_adapter(
+        "table",
+        object(),
+        operations=(Operation(service="database", method="put", kind=OperationKind.WRITE),),
+        connection=(Field("password", "string", secret=True),),
+    )
+    return check_shared(job, SparkRules({"table": adapter}))
 
 
-class Resolve(unittest.TestCase):
-    def test_substitution_only_for_inputs(self):
-        job = {"a": "{{ config.x }}/{{ steps_table.col }}", "b": ["{{ secrets.s }}"]}
-        out, problems = resolve(job, {"x": "v"}, {"s": "pw"})
-        self.assertEqual(out["a"], "v/{{ steps_table.col }}")
-        self.assertEqual(out["b"], ["pw"])
-        self.assertEqual(problems, [])
-
-    def test_missing_value_never_prints_secrets(self):
-        _, problems = resolve({"a": "{{ secrets.s }}"}, {}, {"other": "topsecret"})
-        self.assertEqual(problems, ["secrets.s has no value"])
-
-    def test_overlay_null_deletes(self):
-        merged = merge_overlay({"a": {"b": 1, "c": 2}, "d": 3}, {"a": {"b": None, "e": 5}})
-        self.assertEqual(merged, {"a": {"c": 2, "e": 5}, "d": 3})
-
-    def test_load_from_s3(self):
-        from unittest.mock import MagicMock, patch
-        mock_body = MagicMock()
-        mock_body.read.return_value = b"name: from_s3\nkind: SparkJob\nspec: {}\n"
-        mock_s3 = MagicMock()
-        mock_s3.get_object.return_value = {"Body": mock_body}
-
-        with patch("boto3.client", return_value=mock_s3):
-            job = load_job("s3://test-bucket/jobs/s3_events_to_delta/job.yaml")
-            self.assertEqual(job["name"], "from_s3")
-            mock_s3.get_object.assert_called_with(Bucket="test-bucket", Key="jobs/s3_events_to_delta/job.yaml")
-
-            # test directory resolution to job.yaml
-            job_dir = load_job("s3://test-bucket/jobs/s3_events_to_delta/")
-            self.assertEqual(job_dir["name"], "from_s3")
-            mock_s3.get_object.assert_called_with(Bucket="test-bucket", Key="jobs/s3_events_to_delta/job.yaml")
+def test_spark_rules_accept_valid_job_and_reject_misplaced_secret(definition_adapter):
+    job = sample_job()
+    assert issues(job, definition_adapter) == []
+    job["outputs"][0]["arguments"]["path"] = "{{ secrets.key }}"
+    assert any(issue.code == "secret-placement" for issue in issues(job, definition_adapter))
+    job["outputs"][0]["arguments"].clear()
+    job["connections"]["db"]["password"] = "literal-password"
+    assert any(issue.code == "literal-secret" for issue in issues(job, definition_adapter))
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_shared_checker_flags_cycles_and_unknown_parameters(definition_adapter):
+    job = sample_job()
+    job["steps"] = [{"name": "first", "sql": "SELECT * FROM second"}, {"name": "second", "sql": "SELECT * FROM first"}]
+    assert any(issue.code == "dependency" for issue in issues(job, definition_adapter))
+    job["steps"][0]["sql"] = "SELECT :not_declared"
+    assert any(issue.code == "unknown-parameter" for issue in issues(job, definition_adapter))
 
+
+def test_spark_uses_core_manifest_limit_and_overlay(tmp_path):
+    path, overlay = tmp_path / "job.yaml", tmp_path / "overlay.yml"
+    path.write_text("kind: SparkJob\nname: sample\nruntime:\n  old: yes\n", encoding="utf-8")
+    overlay.write_text("runtime:\n  old: null\n", encoding="utf-8")
+    loaded = load_job(path, overlays=(overlay,))
+    assert loaded["runtime"] == {}
+    with pytest.raises(JobError, match="larger than"):
+        load_job_text("a" * (MAX_MANIFEST_BYTES + 1))
+
+
+def test_remote_manifest_folder_uses_bucket_root_job_file(monkeypatch):
+
+    calls = []
+
+    class Client:
+        def get_object(self, **kwargs):
+            calls.append(kwargs)
+            return {"Body": io.BytesIO(b"kind: SparkJob\n")}
+
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: Client()))
+    assert _read_s3("s3://bucket/", 100) == "kind: SparkJob\n"
+    assert calls == [{"Bucket": "bucket", "Key": "job.yaml"}]
+    assert resolve_job_location("s3://bucket/folder/") == "s3://bucket/folder/job.yaml"
+
+
+def test_input_resolution_preserves_non_input_references():
+    job = sample_job()
+    resolved, missing = resolve(job, {"tenant": "acme"}, {"key": "secret-value"})
+    assert missing == []
+    assert resolved["steps"][0]["sql"] == "SELECT :tenant AS id"
+    assert resolved["connections"]["db"]["password"] == "secret-value"

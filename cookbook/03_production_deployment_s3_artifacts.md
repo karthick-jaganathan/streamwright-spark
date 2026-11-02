@@ -40,9 +40,11 @@ def _bootstrap_wheels():
     if has_wheels and unpacked not in sys.path:
         sys.path.insert(0, unpacked)
 
+
 if __name__ == "__main__":
     _bootstrap_wheels()
     from streamwright.spark.cli import main
+
     raise SystemExit(main(["run", "--driver"] + sys.argv[1:]))
 ```
 
@@ -68,8 +70,8 @@ s3a://my-code-bucket/packages/streamwright_deltalake-0.0.1-py3-none-any.whl,\
 s3a://my-code-bucket/packages/streamwright_kafka-0.0.1-py3-none-any.whl,\
 s3a://my-code-bucket/packages/delta_spark-3.2.1-py3-none-any.whl \
   s3a://my-code-bucket/entrypoint.py \
-  --job s3://my-code-bucket/jobs/s3_events_to_delta/job.yaml \
-  --overlay s3://my-code-bucket/jobs/s3_events_to_delta/emr.yaml \
+  --job s3://my-code-bucket/jobs/kafka/order_files.yaml \
+  --overlay s3://my-code-bucket/jobs/kafka_order_files/emr.yaml \
   --set kafka_bootstrap=b-1.my-cluster.kafka.us-east-1.amazonaws.com:9092 \
   --set lake_bucket=my-prod-lake \
   --once

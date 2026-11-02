@@ -1,26 +1,33 @@
 """
-What an adapter's read/write handler may use while a batch runs. PROPOSED. Not run yet: needs Spark.
+What an adapter's read/write handler may use while a batch runs.
 
 Handlers receive this object (`rt`) instead of reaching into the executor, so an adapter written by someone else needs
 only this surface: the session and batch context, pinned reference values, the file-error list, small file-system
 helpers (driver side, no Spark job), and SQL-literal rendering for predicates.
 """
 
-from streamwright.spark.job.resolve import references
-from streamwright.spark.runtime import refs
-
+from streamwright.core.jobs import refs
+from streamwright.core.jobs.refs import references
+from streamwright.spark.io.sql import quote_literal
 
 __all__ = ["StepRuntime"]
 
 
-class StepRuntime(object):
-    def __init__(self, spark, ctx, manifest, connections, adapters, limits):
+class StepRuntime:
+    def __init__(self, spark, ctx, manifest, connections, adapters, *, limits, state=None):
         self.spark, self.ctx = spark, ctx
         self.pinned = manifest.setdefault("pinned", {})
         self.connections, self.adapters = connections, adapters
         self.cap = int((limits or {}).get("reference_values", 10000))
         self.max_groups = int((limits or {}).get("read_groups", 200))
+        self.listing_parallelism = min(64, max(1, int((limits or {}).get("listing_parallelism", 16))))
+        self.max_files_per_batch = int((limits or {}).get("max_files_per_batch", 2000))
         self.file_errors = []
+        self.schema_reports = []
+        self.state = state
+        self.previous_signatures = {}
+        if state is not None:
+            self.previous_signatures = state.get_schema_signatures(ctx.job_name)
 
     # --- pinned reference values (collected once per batch, then replayed from the manifest) ------------------
 
@@ -29,7 +36,9 @@ class StepRuntime(object):
         if key not in self.pinned:
             rows = self.spark.table(step).select(column).distinct().limit(self.cap + 1).collect()
             if len(rows) > self.cap:
-                raise ValueError("{{ %s }} has more than %d distinct values (runtime.limits.reference_values)" % (key, self.cap))
+                raise ValueError(
+                    "{{ %s }} has more than %d distinct values (runtime.limits.reference_values)" % (key, self.cap)
+                )
             self.pinned[key] = [refs.encode_value(r[0]) for r in rows]
         return [refs.decode_value(v) for v in self.pinned[key]]
 
@@ -39,8 +48,8 @@ class StepRuntime(object):
             rows = self.spark.table(step).limit(self.cap + 1).collect()
             if len(rows) > self.cap:
                 raise ValueError("{{ %s }} has more than %d rows (runtime.limits.reference_values)" % (step, self.cap))
-            self.pinned[key] = [dict((k, refs.encode_value(v)) for k, v in r.asDict().items()) for r in rows]
-        return [dict((k, refs.decode_value(v)) for k, v in row.items()) for row in self.pinned[key]]
+            self.pinned[key] = [{k: refs.encode_value(v) for k, v in r.asDict().items()} for r in rows]
+        return [{k: refs.decode_value(v) for k, v in row.items()} for row in self.pinned[key]]
 
     def path_values(self, value):
         """A path argument: text, a list, or {{ step.column }} (the distinct values of that column)."""
@@ -57,16 +66,44 @@ class StepRuntime(object):
 
     # --- text and predicates ---------------------------------------------------------------------------------
 
-    def text(self, value):
-        """Plain-text substitution for paths and names ({{ batch.id }}). Never used for SQL."""
+    def text(self, value, extra=None):
+        """Substitute path/name tokens ({{ batch.id }}, {{ driver.host }}, {{ uuid }}), never SQL."""
         if not isinstance(value, str):
             return value
-        return value.replace("{{ batch.id }}", self.ctx.batch_id).replace("{{batch.id}}", self.ctx.batch_id)
+        v = value.replace("{{ batch.id }}", self.ctx.batch_id).replace("{{batch.id}}", self.ctx.batch_id)
+        sanitized_batch = self.ctx.batch_id.replace("-", "_")
+        v = v.replace("{{ batch.id_safe }}", sanitized_batch).replace("{{batch.id_safe}}", sanitized_batch)
+        v = v.replace("{{ batch.seq }}", str(self.ctx.batch_sequence)).replace(
+            "{{batch.seq}}", str(self.ctx.batch_sequence)
+        )
+        d_host = self.ctx.engine_metadata.get("driver_host") or "unknown"
+        v = (
+            v.replace("{{ driver.host }}", d_host)
+            .replace("{{driver.host}}", d_host)
+            .replace("{{ driver_host }}", d_host)
+            .replace("{{driver_host}}", d_host)
+        )
+        if extra and isinstance(extra, dict):
+            for k, val in extra.items():
+                v = v.replace("{{ %s }}" % k, str(val)).replace("{{%s}}" % k, str(val))
+        return v
 
     def predicate(self, text):
         """A SQL fragment with {{ step.column }} rendered as escaped literals from the pinned values."""
-        values = dict(((s, c), self.values(s, c)) for s, c in refs.step_columns_used(text))
-        return refs.substitute(text, values, self.ctx.batch_id, self.ctx.batch_ts, self.cap)
+        values = {(s, c): self.values(s, c) for s, c in refs.step_columns_used(text)}
+        d_host = self.ctx.engine_metadata.get("driver_host") or "unknown"
+        return refs.substitute(
+            text,
+            values,
+            {
+                "batch.id": self.ctx.batch_id,
+                "batch.ts": self.ctx.batch_ts,
+                "driver.host": d_host,
+                "driver_host": d_host,
+            },
+            self.cap,
+            quote_text=quote_literal,
+        )
 
     # --- connections -----------------------------------------------------------------------------------------
 
@@ -109,6 +146,9 @@ class StepRuntime(object):
 
     def add_file_error(self, step, path, reason):
         self.file_errors.append((step, path, reason))
+
+    def add_schema_report(self, report):
+        self.schema_reports.append(report)
 
     def empty(self, ddl):
         return self.spark.createDataFrame([], ddl)

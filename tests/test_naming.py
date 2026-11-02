@@ -1,13 +1,15 @@
 import datetime
 import unittest
 
-from streamwright.spark.storage.naming import NamingError, parse_template, plan_names, sanitize
+from streamwright.core.jobs.naming import NamingError, parse_template, plan_names, sanitize
 
-BATCH = "2026-10-17T23:59:30Z"          # just before midnight UTC
+BATCH = "2026-10-17T23:59:30Z"  # just before midnight UTC
 
 
-def render(text, values=None, columns=(), slash=False, batch_ts=BATCH, seq=0):
-    return parse_template(text, columns, slash).render(values or {}, batch_ts, "b42", seq)
+def render(text, values=None, columns=(), *, slash=False, batch_ts=BATCH, seq=0, driver_host="ip-10-0-0-1"):
+    return parse_template(text, columns, slash, constants=("driver_host",)).render(
+        values or {}, batch_ts, "b42", seq, {"driver_host": driver_host}
+    )
 
 
 class DateStyle(unittest.TestCase):
@@ -16,12 +18,12 @@ class DateStyle(unittest.TestCase):
         self.assertEqual(render("{today:%Y-%m-%d}"), "2026-10-17")
         self.assertEqual(render("{now}"), "20261017T235930Z")
         self.assertEqual(render("{now:%F_%H%M%S}"), "2026-10-17_235930")
-        with self.assertRaises(NamingError):          # %T would put colons in a name
+        with self.assertRaises(NamingError):  # %T would put colons in a name
             parse_template("{now:%T}")
 
     def test_offsets_like_date_dash_d(self):
         self.assertEqual(render("{today-1d}"), "20261016")
-        self.assertEqual(render("{now+1h:%Y%m%d%H}"), "2026101800")        # crosses midnight
+        self.assertEqual(render("{now+1h:%Y%m%d%H}"), "2026101800")  # crosses midnight
         self.assertEqual(render("{today-1w:%Y%m%d}"), "20261010")
         self.assertEqual(render("{now+1d-2h:%d%H}"), "1821")
 
@@ -40,19 +42,29 @@ class DateStyle(unittest.TestCase):
         self.assertEqual(render("{today}", batch_ts="2026-10-18T01:30:00+02:00"), "20261017")
 
     def test_column_dates(self):
-        self.assertEqual(render("{client_id}_{event_date:%Y%m%d}", {"client_id": "acme", "event_date": "2026-10-15"},
-                                ["client_id", "event_date"]), "acme_20261015")
+        self.assertEqual(
+            render(
+                "{client_id}_{event_date:%Y%m%d}",
+                {"client_id": "acme", "event_date": "2026-10-15"},
+                ["client_id", "event_date"],
+            ),
+            "acme_20261015",
+        )
         self.assertEqual(render("{d:%Y%m%d}", {"d": datetime.date(2026, 2, 3)}, ["d"]), "20260203")
         self.assertEqual(render("{d-1d:%Y%m%d}", {"d": datetime.datetime(2026, 3, 1, 5)}, ["d"]), "20260228")
 
     def test_layout_slash_and_hive(self):
-        self.assertEqual(render("{client_id}/{today:%Y/%m/%d}", {"client_id": "acme"}, ["client_id"], slash=True),
-                         "acme/2026/10/17")
-        self.assertEqual(render("client={client_id}/dt={today:%Y-%m-%d}", {"client_id": "acme"}, ["client_id"],
-                                slash=True), "client=acme/dt=2026-10-17")
+        self.assertEqual(
+            render("{client_id}/{today:%Y/%m/%d}", {"client_id": "acme"}, ["client_id"], slash=True), "acme/2026/10/17"
+        )
+        self.assertEqual(
+            render("client={client_id}/dt={today:%Y-%m-%d}", {"client_id": "acme"}, ["client_id"], slash=True),
+            "client=acme/dt=2026-10-17",
+        )
 
     def test_seq_and_batch_id(self):
         self.assertEqual(render("{batch_id}-{seq}.csv", seq=3), "b42-00003.csv")
+        self.assertEqual(render("{driver_host}_{batch_id}-{seq}.csv", seq=3), "ip-10-0-0-1_b42-00003.csv")
 
 
 class Safety(unittest.TestCase):
@@ -74,9 +86,19 @@ class Safety(unittest.TestCase):
         self.assertEqual(render("{c}", {"c": "a/b"}, ["c"], slash=True), "a_b")
 
     def test_parse_errors(self):
-        for text, cols in [("{nope}", []), ("{today:%Q}", []), ("{today:%}", []), ("{batch_id:%Y}", []),
-                           ("{c-1x}", ["c"]), ("x y", []), ("{today:%Y;rm}", []), ("{c}..{c}", ["c"]),
-                           ("fixed.csv", []), ("{today:%-Z}", []), ("{}", [])]:
+        for text, cols in [
+            ("{nope}", []),
+            ("{today:%Q}", []),
+            ("{today:%}", []),
+            ("{batch_id:%Y}", []),
+            ("{c-1x}", ["c"]),
+            ("x y", []),
+            ("{today:%Y;rm}", []),
+            ("{c}..{c}", ["c"]),
+            ("fixed.csv", []),
+            ("{today:%-Z}", []),
+            ("{}", []),
+        ]:
             with self.assertRaises(NamingError, msg=text):
                 parse_template(text, cols)
 
@@ -93,7 +115,16 @@ class Planning(unittest.TestCase):
     def test_collision_is_detected_before_any_write(self):
         file_t = parse_template("{c}.csv", ["c"])
         with self.assertRaises(NamingError):
-            plan_names(file_t, None, [(("a b",), {"c": "a b"}), (("a/b",), {"c": "a_b"}), ], BATCH, "b1")
+            plan_names(
+                file_t,
+                None,
+                [
+                    (("a b",), {"c": "a b"}),
+                    (("a/b",), {"c": "a_b"}),
+                ],
+                BATCH,
+                "b1",
+            )
 
     def test_plan(self):
         file_t = parse_template("{client_id}_{today}.csv", ["client_id"])

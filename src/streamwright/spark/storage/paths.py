@@ -1,5 +1,5 @@
 """
-Path safety for object-store and file adapters. PROPOSED.
+Path safety for object-store and file adapters.
 
 Jobs use the connectors' own URL forms (`s3://bucket/key`, `gs://bucket/key`, `az://container/key`, `/local/dir`);
 the adapter translates to the Hadoop form (`s3a://`, `abfss://...`) only when it hands a path to Spark. A path must be
@@ -10,12 +10,10 @@ import posixpath
 import re
 from urllib.parse import urlparse
 
-
-__all__ = ["spark_text", "StorageError", "REDACTION_REGEX", "scheme_of", "normalize", "inside", "check_path"]
+__all__ = ["REDACTION_REGEX", "StorageError", "check_path", "inside", "normalize", "scheme_of", "spark_text"]
 
 # Spark hides matching conf values in its UI and event logs
 REDACTION_REGEX = "(?i)secret|password|token|access[.]key|private[.]key|account[.]key|credential|connection[.]string"
-_ALIASES = {"s3a": "s3", "s3n": "s3", "gcs": "gs", "azure": "az"}
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -28,7 +26,7 @@ def scheme_of(path):
 
 
 def normalize(path):
-    """Scheme aliases collapsed (s3a -> s3), slashes collapsed after the scheme, local paths normalized."""
+    """Slashes collapsed after the scheme; local paths normalized."""
     if _CONTROL.search(path):
         raise StorageError("a path may not contain control characters")
     scheme = scheme_of(path)
@@ -36,7 +34,7 @@ def normalize(path):
         return posixpath.normpath(path) + ("/" if path.endswith("/") and path != "/" else "")
     rest = path.split("://", 1)[1]
     rest = re.sub(r"/{2,}", "/", rest)
-    return "%s://%s" % (_ALIASES.get(scheme, scheme), rest)
+    return "%s://%s" % (scheme, rest)
 
 
 def inside(root, path):

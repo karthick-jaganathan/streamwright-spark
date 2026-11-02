@@ -1,0 +1,437 @@
+# ==============================================================================
+# Pipeline: Multi-Partner Schema Harmonization & Quality Routing
+# Engine:   StreamWright Spark (Distributed Batch Processing)
+# Pattern:  Heterogeneous Partner Feeds -> URI Prefix Matching
+#           -> Canonical Vocabulary Mapping -> Schema Drift Detection
+#           -> Zero-Overhead Row Error Quarantine -> Delta Lake Merge
+# ==============================================================================
+#
+# Key Features Showcased:
+# ------------------------------------------------------------------------------
+# 1. NAMED REGEX EXTRACTION & DICT-BASED MAPPINGS (`path_pattern:` & `columns:`):
+#    Multiple external partners (e.g. Partner Alpha, Beta) drop feeds with
+#    divergent column names into distinct S3 folder prefixes.
+#    StreamWright extracts variables (like `partner`) directly from the file URI
+#    via named regex (`path_pattern: "partners/(?P<partner>[^/]+)/"`), auto-injects
+#    them as DataFrame columns (`h.partner`), and dispatches schema mapping via `by: partner`.
+#    All mappings sit directly in the YAML for clear self-documentation.
+#
+# 2. EMBEDDED CONTROLLED VOCABULARY (`vocabulary:`):
+#    Validates all mapping definitions against an enterprise canonical data dictionary,
+#    catching unauthorized column mappings or invalid data types before Spark runs.
+#
+# 3. SCHEMA DRIFT VISIBILITY (`_schema_report`):
+#    Driver inspects file headers without launching Spark jobs, comparing observed
+#    headers against expected mappings. Files with new unmapped columns are flagged
+#    as status = 'drift' in the internal `_schema_report` view, enabling automated
+#    alerting and auditing via SQL without interrupting ingestion.
+#
+# 4. DEAD-LETTER FILE REJECTIONS (`_file_errors`):
+#    Files with malformed headers, missing required fields, or unrecognized partner
+#    paths are automatically excluded from the main DataFrame and logged to the
+#    internal `_file_errors` view for audit persistence.
+#
+# 5. ZERO-OVERHEAD ROW-LEVEL QUALITY ROUTING (`row_errors: true`):
+#    Appends a virtual `_row_errors ARRAY<STRING>` column flagging cast failures
+#    and null required fields via pure Catalyst SQL expressions.
+#    Adds ZERO extra Spark actions (count/collect/show forbidden).
+#
+# 6. DUAL-STREAM BRANCHING:
+#    - Clean rows (`size(_row_errors) = 0`) -> Idempotently merged into Delta Lake.
+#    - Corrupted rows (`size(_row_errors) > 0`) -> Quarantined to S3 JSONL with reasons.
+#
+# 7. PARALLEL JDBC AUDIT LOGGING (`method: write`, mode append):
+#    Logs schema drift from `_schema_report` and rejected files from `_file_errors`
+#    into PostgreSQL audit tables directly from Spark executors via parallel JDBC.
+# ==============================================================================
+
+kind: SparkJob
+version: 1
+name: s3_partner_orders
+description: Harmonizes heterogeneous partner file feeds into a canonical lakehouse schema, audits schema drift, quarantines corrupted records, and merges clean orders into Delta Lake.
+
+spec:
+  config:
+    landing_bucket: {type: string}
+    lake_bucket:    {type: string}
+  secrets:
+    audit_db_password:     {type: string}
+    ops_db_password:       {type: string}
+
+connections:
+  # ----------------------------------------------------------------------------
+  # Landing S3: Raw drop-zone where diverse partners upload batch files
+  # ----------------------------------------------------------------------------
+  landing_s3:
+    provider: s3
+    roots: ["s3://{{ config.landing_bucket }}/"]
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Lake S3: Storage backing analytical Delta tables and dead-letter quarantine
+  # ----------------------------------------------------------------------------
+  lake_s3:
+    provider: s3
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    region: us-east-1
+
+  # ----------------------------------------------------------------------------
+  # Delta Lake: Analytical ACID table storage (inherits credentials from lake_s3)
+  # ----------------------------------------------------------------------------
+  lake_delta:
+    provider: deltalake
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    storage: lake_s3
+    schema: analytics
+    schema_location: "s3://{{ config.lake_bucket }}/analytics/"
+    schema_comment: "Central enterprise analytics data mart for orders and reporting"
+
+  # ----------------------------------------------------------------------------
+  # Audit PostgreSQL: Operational audit logs for schema drift & file rejections
+  # ----------------------------------------------------------------------------
+  audit_db:
+    provider: postgres
+    host: audit-postgres.internal.net
+    port: 5432
+    database: partner_registry
+    user: streamwright_app
+    password: "{{ secrets.audit_db_password }}"
+    sslmode: require
+
+  # ----------------------------------------------------------------------------
+  # Ops PostgreSQL: StreamWright internal control plane (leases, manifests, receipts)
+  # ----------------------------------------------------------------------------
+  ops_db:
+    provider: postgres
+    host: ops-postgres.internal.net
+    port: 5432
+    database: ops
+    user: sw_state
+    password: "{{ secrets.ops_db_password }}"
+    sslmode: require
+
+steps:
+  # ============================================================================
+  # STEP 1: Ingest & Harmonize Multi-Partner Files
+  # ----------------------------------------------------------------------------
+  # - path:                 -> Raw partner files (.csv, .tsv, etc.)
+  # - format: auto          -> Inspects file extensions (.csv, .tsv, .parquet, .jsonl).
+  # - columns:              -> Embedded partner mapping rules matched by longest prefix.
+  # - vocabulary:           -> Embedded canonical controlled vocabulary.
+  # - on_unmapped_column: warn -> Flags new columns as schema drift in _schema_report.
+  # - on_mismatch: skip     -> Rejects unknown/malformed files to _file_errors view.
+  # - row_errors: true      -> Adds _row_errors ARRAY<STRING> for cast/required failures.
+  # - Pinned Manifest       -> Full plan serialized in sw_batches for replay stability.
+  # ============================================================================
+  - name: harmonized_feed
+    connection: landing_s3
+    service: object
+    method: read
+    arguments:
+      path:
+        - "s3://{{ config.landing_bucket }}/partners/alpha/alpha_orders_01.csv"
+        - "s3://{{ config.landing_bucket }}/partners/beta/beta_orders_01.tsv"
+        - "s3://{{ config.landing_bucket }}/partners/unknown/rejected_01.csv"
+      format: auto
+      path_pattern: "partners/(?P<partner>[^/]+)/"
+      on_unmapped_column: warn
+      on_mismatch: skip
+      row_errors: true
+      row_index: "row_id"
+      options:
+        header: true
+
+      # ------------------------------------------------------------------------
+      # Pattern-Based Dynamic Column Folding (NOT required in vocabulary)
+      # ------------------------------------------------------------------------
+      column_groups:
+        # Folds dynamic metric columns (e.g. fee_processing, metric_shipping) into MAP<STRING, DOUBLE>
+        - name: metrics
+          regex: "^(fee|metric)_[a-z0-9_]+$"
+          type: double
+          strip_prefix: "metric_"
+
+        # Folds dynamic partner attributes (e.g. attr_region, attr_channel) into MAP<STRING, STRING>
+        - name: extra_attributes
+          glob: "attr_*"
+          type: string
+          strip_prefix: "attr_"
+
+      # ------------------------------------------------------------------------
+      # Embedded Controlled Canonical Vocabulary
+      # ------------------------------------------------------------------------
+      vocabulary:
+        - {name: order_id,    type: bigint}
+        - {name: customer_id, type: string}
+        - {name: amount,      type: double}
+        - {name: currency,    type: string}
+        - {name: event_ts,    type: timestamp}
+        - {name: status,      type: string}
+
+      # ------------------------------------------------------------------------
+      # Embedded Per-Partner Column Mapping Rules (Selected by extracted partner)
+      # ------------------------------------------------------------------------
+      columns:
+        by: partner
+
+        # Partner Alpha (CSV): Order_Num, Cust_ID, AmountUSD, EventDate
+        # Uses regex: to match header casing variations (Order_Num, order_id, Order #)
+        alpha:
+          - regex: '(?i)^order[_\s]?(num|id|no)$'
+            canonical: "order_id"
+            type: "bigint"
+            required: true
+          - header: "Cust_ID"
+            canonical: "customer_id"
+            type: "string"
+          - header: "AmountUSD"
+            canonical: "amount"
+            type: "double"
+            required: true
+          - header: "EventDate"
+            canonical: "event_ts"
+            type: "timestamp"
+
+        # Partner Beta (TSV): transaction_id, client_key, total, timestamp
+        # Uses regex: to match transaction_id or txn_id variations
+        beta:
+          - regex: '(?i)^(transaction|txn)[_\s]?(id|num)$'
+            canonical: "order_id"
+            type: "bigint"
+            required: true
+          - header: "client_key"
+            canonical: "customer_id"
+            type: "string"
+          - header: "total"
+            canonical: "amount"
+            type: "double"
+            required: true
+          - header: "timestamp"
+            canonical: "event_ts"
+            type: "timestamp"
+
+  # ============================================================================
+  # STEP 2: Business Transformation & Lineage Checkpoint
+  # ----------------------------------------------------------------------------
+  # Severing Catalyst recursive plan memory references to disk before dual-branch
+  # fan-out to Delta merge (clean) and S3 quarantine (corrupted).
+  # Uses auto-injected h.partner directly as partner_id.
+  # ============================================================================
+  - name: harmonized_orders
+    checkpoint: true
+    persist: memory_and_disk
+    sql: |
+      SELECT
+        h.order_id,
+        h.row_id,
+        h.partner AS partner_id,
+        h.customer_id,
+        h.amount,
+        'USD' AS currency,
+        h.event_ts,
+        CAST(h.event_ts AS DATE) AS event_date,
+        'RECEIVED' AS status,
+        h.metrics,
+        h.extra_attributes,
+        h._source_file,
+        h._row_errors,
+        :batch_id AS batch_id,
+        current_timestamp() AS processed_at
+      FROM harmonized_feed h
+
+outputs:
+  # ============================================================================
+  # OUTPUT 1: Clean Records Delta Lake Merge
+  # ----------------------------------------------------------------------------
+  # Eager Action #1:
+  # Merges valid records into partitioned Delta Lake table.
+  # - Predicate: size(_row_errors) = 0 (only completely clean records).
+  # - schema_evolution: add_columns (allows schema expansion with autoMerge).
+  # - target_predicate: prunes Delta historical partition files.
+  # ============================================================================
+  - name: clean_orders_delta_merge
+    connection: lake_delta
+    service: table
+    method: write
+    arguments:
+      mode: merge
+      path: "s3://{{ config.lake_bucket }}/delta/harmonized_orders"
+      table_name: harmonized_orders
+      partition_by: [event_date]
+      condition: "target.order_id = source.order_id"
+      target_predicate: "target.event_date IN ({{ harmonized_orders.event_date }})"
+      schema_evolution: add_columns
+      when_matched:
+        - action: update
+      when_not_matched:
+        - action: insert
+    sql: |
+      SELECT
+        order_id,
+        row_id,
+        partner_id,
+        customer_id,
+        amount,
+        currency,
+        event_ts,
+        event_date,
+        status,
+        metrics,
+        extra_attributes,
+        _source_file,
+        batch_id,
+        processed_at
+      FROM harmonized_orders
+      WHERE size(_row_errors) = 0
+
+  # ============================================================================
+  # OUTPUT 2: Dead-Letter Row Quarantine to S3
+  # ----------------------------------------------------------------------------
+  # Eager Action #2:
+  # Routes corrupted records (failed type casts or missing required columns)
+  # directly to an S3 quarantine bucket in newline-delimited JSON format.
+  # Explanatory failure reasons are extracted directly from _row_errors.
+  # ============================================================================
+  - name: quarantine_corrupted_records
+    connection: lake_s3
+    service: object
+    method: write
+    arguments:
+      path: "s3://{{ config.lake_bucket }}/quarantine/orders/"
+      layout: "dt={today:%Y-%m-%d}"
+      file_name: "batch_{batch_id}_quarantine.jsonl"
+      format: jsonl
+      mode: overwrite
+    sql: |
+      SELECT
+        order_id,
+        row_id,
+        partner_id,
+        customer_id,
+        amount,
+        currency,
+        event_ts,
+        status,
+        metrics,
+        extra_attributes,
+        _source_file,
+        _row_errors,
+        array_join(_row_errors, '; ') AS failure_reasons,
+        batch_id,
+        processed_at
+      FROM harmonized_orders
+      WHERE size(_row_errors) > 0
+
+  # ============================================================================
+  # OUTPUT 3: Audit Schema Drift Events
+  # ----------------------------------------------------------------------------
+  # Eager Action #3:
+  # Records schema drift occurrences discovered across incoming files into PostgreSQL.
+  #
+  # Virtual View `_schema_report`:
+  # Generated during Step 1's driver header inspection. Contains:
+  # - step: Step name ('harmonized_feed')
+  # - path: File URI
+  # - prefix: Matched partner prefix ('alpha', 'beta')
+  # - status: 'drift' (new columns added), 'ok' (clean match), or 'error'
+  # - header_hash: SHA-256 fingerprint of the observed header
+  # - unmapped: ARRAY<STRING> of unrecognized column names
+  # - missing_optional: ARRAY<STRING> of non-required columns missing from file
+  #
+  # Parallel Bulk Append:
+  # `method: write` (mode append) writes rows directly across Spark executors using parallel JDBC.
+  # No staging table or driver transaction is required.
+  # ============================================================================
+  - name: schema_drift_audit_log
+    connection: audit_db
+    service: database
+    method: write
+    arguments:
+      table: audit.schema_drift_events
+    sql: |
+      SELECT
+        step,
+        path AS file_uri,
+        prefix AS matched_partner_prefix,
+        status,
+        header_hash,
+        array_join(unmapped, ',') AS unmapped_columns,
+        array_join(missing_optional, ',') AS missing_optional_columns,
+        :batch_id AS batch_id,
+        current_timestamp() AS detected_at
+      FROM _schema_report
+      WHERE status = 'drift'
+
+  # ============================================================================
+  # OUTPUT 4: Audit File-Level Rejections
+  # ----------------------------------------------------------------------------
+  # Eager Action #4:
+  # Records file-level rejection events (unrecognized partner path, missing required
+  # columns in header, corrupted file format) into the ops database.
+  #
+  # Virtual View `_file_errors`:
+  # Populated when a file fails driver pre-validation (e.g. unknown partner prefix
+  # under `on_mismatch: skip`). Contains:
+  # - step: Step name
+  # - path: Rejected file URI
+  # - reason: Detailed explanation (e.g. "no partner prefix matched")
+  #
+  # Parallel Bulk Append:
+  # `method: write` (mode append) streams rows directly from executors via Spark JDBC.
+  # ============================================================================
+  - name: file_rejection_audit_log
+    connection: audit_db
+    service: database
+    method: write
+    arguments:
+      table: audit.file_rejection_events
+    sql: |
+      SELECT
+        step,
+        path AS file_uri,
+        reason,
+        :batch_id AS batch_id,
+        current_timestamp() AS rejected_at
+      FROM _file_errors
+
+runtime:
+  state:
+    connection: ops_db
+    schema: sw_ops
+
+  # Declarative Environment Variables:
+  # Non-secret values reach Spark; secret values stay on the driver
+  env:
+    STREAMWRIGHT_SECRET_AUDIT: "{{ secrets.audit_db_password }}"
+    AWS_DEFAULT_REGION: us-east-1
+
+  # AWS Secrets Manager Resolution:
+  # Resolves multiple distinct secret IDs into job-level secrets
+  secrets:
+    source: aws_secretsmanager
+    mapping:
+      audit_db_password: "production/rds/audit_db_password"
+      ops_db_password: "production/rds/ops_db_password"
+      # Or multi-secret list:
+      # ids: ["production/partner_registry/secrets"]
+
+  platform:
+    type: local                                 # local | emr_ec2 | standalone
+    # When deployed to EMR on EC2:
+    # type: emr_ec2
+    # region: us-east-1
+    # staging: "s3://{{ config.lake_bucket }}/staging/"
+    # cluster:
+    #   # Resilient to cluster termination/recreation via CloudFormation:
+    #   stack_name: "prod-data-platform-emr"    # or stack_arn: "arn:aws:cloudformation:..."
+    #   # id: "j-1234567890ABC"                 # or static cluster ID
+
+  spark:
+    version: "3.5.x"
+    app_name: s3_partner_orders
+    conf:
+      spark.checkpoint.dir: "s3://{{ config.lake_bucket }}/checkpoints/spark_lineage/"
+      spark.executor.memory: 4g
+      spark.executor.cores: "2"
+      spark.sql.adaptive.enabled: "true"
+      spark.sql.session.timeZone: UTC

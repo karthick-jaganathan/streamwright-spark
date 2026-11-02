@@ -16,10 +16,11 @@ StreamWright Spark allows declaring a `target_predicate` with pinned upstream va
 outputs:
   - name: merge_orders
     connection: lake_delta
-    service: tables
-    method: merge
+    service: table
+    method: write
     arguments:
-      table_path: "s3a://{{ config.lake_bucket }}/delta/orders"
+      mode: merge
+      path: "s3a://{{ config.lake_bucket }}/delta/orders"
       partition_by: [client_id, event_date]
       condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
       target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
@@ -84,10 +85,11 @@ StreamWright automatically manages catalog registration in Hive Metastore or Del
 outputs:
   - name: merge_orders
     connection: lake_delta
-    service: tables
-    method: merge
+    service: table
+    method: write
     arguments:
-      table_path: "s3a://{{ config.lake_bucket }}/delta/orders"
+      mode: merge
+      path: "s3a://{{ config.lake_bucket }}/delta/orders"
       table_name: orders
       schema: analytics
       schema_location: "s3a://{{ config.lake_bucket }}/analytics"

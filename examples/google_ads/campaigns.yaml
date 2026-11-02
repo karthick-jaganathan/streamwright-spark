@@ -1,0 +1,98 @@
+# ==============================================================================
+# Pipeline: Google Ads -> Spark -> Delta/Parquet (connector contract v1.2 §6a)
+# Engine:   StreamWright Spark (distributed batch)
+# Pattern:  SOURCE-CONNECTOR CALL STEP on the driver -> DataFrame -> native Spark write
+# ==============================================================================
+#
+# The `google_ads` connector ships only a source adapter, yet a SparkJob reaches it
+# through a *call step*: the driver runs the connector via the source engine
+# (SourceRunner.collect), streams its records into a DataFrame in bounded batches
+# (`page_size`), and the rest of the job is ordinary Spark SQL and a native write.
+# `sw connectors` shows this as `google_ads  [source, duckdb (call), spark (call)]`.
+#
+# Execution policy (§6a), the same vocabulary as DuckDBJob and source streams:
+#   retry {max_attempts, backoff, max_delay}  rate_limit {requests, per}
+#   page_size   timeout   on_error: fail | skip | warn
+# ==============================================================================
+
+kind: SparkJob
+version: 1
+name: google_ads_campaigns
+description: Pulls Google Ads campaigns through a Spark call step and writes them to the lakehouse as Parquet.
+
+spec:
+  config:
+    customer_id:       {type: string}
+    login_customer_id: {type: string}
+    lake_bucket:       {type: string}
+  secrets:
+    developer_token: {type: string}
+    client_id:       {type: string}
+    client_secret:   {type: string}
+    refresh_token:   {type: string}
+
+connections:
+  # Source-only connector: reached here through a call step (no native Spark adapter needed).
+  google_ads_api:
+    provider: google_ads
+    developer_token: "{{ secrets.developer_token }}"
+    client_id: "{{ secrets.client_id }}"
+    client_secret: "{{ secrets.client_secret }}"
+    refresh_token: "{{ secrets.refresh_token }}"
+    login_customer_id: "{{ config.login_customer_id }}"
+
+  lake_s3:
+    provider: s3
+    roots: ["s3://{{ config.lake_bucket }}/"]
+    region: us-east-1
+
+steps:
+  # CALL STEP: run the google_ads source connector on the driver; records -> DataFrame.
+  - name: raw_campaigns
+    connection: google_ads_api
+    service: GoogleAdsService
+    method: search_stream
+    # execution policy (§6a): retry transient gRPC errors, throttle, bound the call, page the load
+    retry: {max_attempts: 5, backoff: exponential, max_delay: 30s}
+    rate_limit: {requests: 2, per: 1s}
+    timeout: 60s
+    page_size: 1000
+    on_error: fail
+    arguments:
+      customer_id: "{{ config.customer_id }}"
+      query: |
+        SELECT campaign.id, campaign.name, campaign.status
+        FROM campaign
+        ORDER BY campaign.id
+        LIMIT 50
+    sql: SELECT * FROM input
+
+  - name: campaign_metrics
+    sql: |
+      SELECT campaign.status AS status, COUNT(*) AS campaign_count
+      FROM raw_campaigns
+      GROUP BY campaign.status
+
+outputs:
+  - name: save_campaigns
+    connection: lake_s3
+    service: object
+    method: write
+    # retry a transient object-store write; a failed write fails the batch (on_error defaults to fail)
+    retry: {max_attempts: 3}
+    timeout: 120s
+    arguments:
+      path: "s3://{{ config.lake_bucket }}/google_ads/campaign_metrics/"
+      format: parquet
+      mode: overwrite
+    sql: SELECT * FROM campaign_metrics
+
+runtime:
+  state:
+    sqlite: /var/lib/streamwright/google_ads_campaigns.db
+  platform:
+    type: local
+  spark:
+    app_name: google_ads_campaigns
+    conf:
+      spark.sql.session.timeZone: UTC

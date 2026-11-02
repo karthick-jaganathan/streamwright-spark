@@ -10,9 +10,9 @@ Practical, production-tested recipes, operational guides, and architectural patt
 Step-by-step guide to managing the local multi-service cluster:
 - Clean volume purge & teardown (`make down`).
 - Starting PostgreSQL, LocalStack S3, Kafka, Hive Metastore, and Trino (`make lakehouse`).
-- Automated topic and data seeding (`make seed`).
+- Automated topic and data seeding (`make seed-order-files`).
 - Packaging and syncing artifacts to S3 (`make publish-s3`).
-- Running jobs via blind container submission (`make submit-blind`) or direct host execution (`sw spark run`).
+- Running jobs via blind container submission (`make submit-order-files`) or direct host execution (`sw spark run`).
 - Querying and inspecting Delta tables in Trino (`make trino`).
 
 ### 2. [Delta Lake Merge & Declarative Catalog Registration](02_delta_lake_merge_and_catalog.md)
@@ -28,7 +28,17 @@ Architectural pattern for running blind Spark jobs on cloud clusters (EMR, Kuber
 - Dynamic runtime wheel unpacking via `entrypoint.py` and `--py-files`.
 - Decoupling infrastructure images from pipeline application versions.
 
+### 4. [Multi-Schema Microbatch Ingestion & Quality Routing](04_multi_schema_microbatch_processing.md)
+End-to-end guide to multi-schema microbatch handling:
+- Preventing native Spark positional column misalignment via `schema_mode: by_name`.
+- Per-file format resolution (`format: auto`) for mixed batches.
+- Replay-stable plan pinning in `manifest["pinned"]["ingest:<step>"]`.
+- Schema drift visibility via `_schema_report` and `on_unmapped_column`.
+- Row-level quality routing (`row_errors: true` & `_row_errors`).
+- Delta Lake schema evolution (`schema_evolution: strict | add_columns`).
+
 ---
 
-## Canonical Pipeline Example
-For a fully working end-to-end pipeline implementation, see [`examples/s3_events_to_delta`](../examples/s3_events_to_delta/README.md).
+## Canonical Pipeline Examples
+- [**`examples/kafka/order_files.yaml`**](../examples/kafka/README.md): Event-driven Kafka notifications, PostgreSQL two-phase operational bookkeeping, Delta Lake merge with target predicate partition pruning, column groups, and split file exports.
+- [**`examples/s3/partner_orders.yaml`**](../examples/s3/README.md): Heterogeneous multi-partner feeds, dynamic URI prefix mapping, enterprise controlled vocabulary, schema drift auditing (`_schema_report`), zero-overhead row error dead-letter quarantine, and Delta Lake merge.

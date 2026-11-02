@@ -1,161 +1,175 @@
-"""
-Per-client column mapping for `object.read` with `columns:`. PROPOSED.
+"""Materialize engine-neutral ingest groups as Spark DataFrames."""
 
-Planning is pure Python (testable without Spark); only `read_groups()` touches Spark.
+from pyspark.sql import Window, functions
 
-Inputs
-  files      the file URIs the batch named
-  mappings   rows of (prefix, header, canonical, type, required); one client's rows share a prefix
-  headers    {file: [header, ...]}, read on the driver (first line only, no Spark job)
-  vocabulary {canonical name: type}; every mapped name must be in it with the same type
-
-Per file: the mapping rows are those with the *longest* prefix that the file URI starts with (startswith, so `_` and
-`%` in a prefix are literal). Header cells are matched by exact text after stripping spaces. Unmapped columns are
-dropped. A file is rejected (reason recorded) when a required canonical column is missing, when two columns map to the
-same name, or when no mapping applies. Files are grouped by (prefix, header signature) so each group is one Spark
-read; the groups are cast to the canonical types with try_cast (a bad cell becomes null, never fails the batch) and
-combined with unionByName.
-"""
-
-import csv
-import io
-import re
-
+from streamwright.core.jobs.ingest import (
+    TYPE_PATTERN,
+    FileReject,
+    Group,
+    IngestError,
+    SchemaReport,
+    check_vocabulary,
+    compute_header_hash,
+    deserialize_plan,
+    is_true,
+    match_column_groups,
+    normalize_columns,
+    normalize_row_index,
+    parse_header,
+    plan_ingest,
+    plan_plain_groups,
+    resolve_file_format,
+    resolve_file_formats,
+    serialize_plan,
+)
 from streamwright.spark.storage.paths import spark_text
 
-
-__all__ = ["IngestError", "TYPE_PATTERN", "plan_groups", "parse_header", "check_vocabulary", "FileReject", "Group"]
-
-TYPE_PATTERN = re.compile(r"^(string|int|bigint|long|double|float|boolean|date|timestamp|decimal\([0-9]{1,2},[0-9]{1,2}\))$")
-_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-_TRUE = ("true", "t", "yes", "y", "1")
-
-
-class IngestError(Exception):
-    """A problem with the job's mapping data itself (not one client's file): the batch must fail."""
-
-
-class FileReject(object):
-    def __init__(self, path, reason):
-        self.path, self.reason = path, reason
-
-
-class Group(object):
-    def __init__(self, prefix, header, columns, files):
-        self.prefix, self.header, self.columns, self.files = prefix, header, columns, files   # columns: [(src, name, type)]
-
-
-def parse_header(line, sep=","):
-    """The cells of a CSV header line, stripped."""
-    rows = list(csv.reader(io.StringIO(line.lstrip("﻿")), delimiter=sep))
-    return [cell.strip() for cell in rows[0]] if rows else []
+__all__ = [
+    "TYPE_PATTERN",
+    "FileReject",
+    "Group",
+    "IngestError",
+    "SchemaReport",
+    "check_vocabulary",
+    "compute_header_hash",
+    "deserialize_plan",
+    "is_true",
+    "match_column_groups",
+    "normalize_columns",
+    "normalize_row_index",
+    "pairwise_union_by_name",
+    "parse_header",
+    "plan_ingest",
+    "plan_plain_groups",
+    "read_groups",
+    "resolve_file_format",
+    "resolve_file_formats",
+    "serialize_plan",
+]
 
 
-def _is_true(value):
-    return value is True or str(value).strip().lower() in _TRUE
-
-
-def check_vocabulary(mappings, vocabulary):
-    """Raises IngestError for mapping rows that are malformed or outside the controlled vocabulary."""
-    problems = []
-    vocab = dict((row["name"], str(row["type"]).strip().lower()) for row in vocabulary) if vocabulary else None
-    for number, row in enumerate(mappings):
-        label = "mapping row %d" % number
-        for key in ("prefix", "header", "canonical", "type"):
-            if row.get(key) in (None, ""):
-                problems.append("%s: %s is empty" % (label, key))
-        canonical, kind = str(row.get("canonical", "")), str(row.get("type", "")).strip().lower()
-        if canonical and not _NAME.match(canonical):
-            problems.append("%s: canonical name %r is not a plain identifier" % (label, canonical))
-        if kind and not TYPE_PATTERN.match(kind):
-            problems.append("%s: type %r is not supported" % (label, kind))
-        if vocab is not None and canonical:
-            if canonical not in vocab:
-                problems.append("%s: %r (prefix %s) is not in the controlled vocabulary" % (
-                    label, canonical, row.get("prefix")))
-            elif kind and vocab[canonical] != kind:
-                problems.append("%s: %r has type %s but the vocabulary says %s" % (label, canonical, kind, vocab[canonical]))
-    if problems:
-        raise IngestError("; ".join(problems[:20]) + (" (and %d more)" % (len(problems) - 20) if len(problems) > 20 else ""))
-
-
-def plan_groups(files, mappings, headers, max_groups=200):
-    """Returns (groups, rejects). Raises IngestError when the mapping data is wrong or there are too many groups."""
-    by_prefix = {}
-    for row in mappings:
-        by_prefix.setdefault(str(row["prefix"]), []).append(row)
-    prefixes = sorted(by_prefix, key=len, reverse=True)
-    groups, rejects = {}, []
-    for path in sorted(set(files)):
-        prefix = next((p for p in prefixes if path.startswith(p)), None)
-        if prefix is None:
-            rejects.append(FileReject(path, "no column mapping for this path"))
-            continue
-        header = headers.get(path)
-        if not header:
-            rejects.append(FileReject(path, "empty or unreadable header"))
-            continue
-        by_header = {}
-        for row in by_prefix[prefix]:
-            by_header[str(row["header"]).strip()] = row
-        chosen, seen, problem = [], {}, None
-        for cell in header:
-            row = by_header.get(cell)
-            if row is None:
-                continue
-            name = str(row["canonical"])
-            if name in seen:
-                problem = "columns %r and %r both map to %s" % (seen[name], cell, name)
-                break
-            seen[name] = cell
-            chosen.append((cell, name, str(row["type"]).strip().lower()))
-        if problem is None:
-            required = sorted(set(str(r["canonical"]) for r in by_prefix[prefix] if _is_true(r.get("required"))))
-            missing = [name for name in required if name not in seen]
-            if missing:
-                problem = "missing required column(s): %s" % ", ".join(missing)
-        if problem is None and not chosen:
-            problem = "no header cell matches a mapped column"
-        if problem is not None:
-            rejects.append(FileReject(path, problem))
-            continue
-        key = (prefix, tuple(header))
-        group = groups.get(key)
-        if group is None:
-            groups[key] = Group(prefix, list(header), chosen, [path])
-        else:
-            group.files.append(path)
-    if len(groups) > max_groups:
-        raise IngestError("%d read groups exceed runtime.limits.read_groups (%d): clients' headers vary more than "
-                          "expected" % (len(groups), max_groups))
-    return [groups[key] for key in sorted(groups)], rejects
-
-
-def read_groups(spark, groups, fmt, options, to_hadoop=None, source_file=None, tracking_column="_source_file"):
-    """
-    One lazy DataFrame: each group is read once (all strings), renamed and try_cast to the canonical types, with the
-    source file added; groups are combined with unionByName so a client's missing columns become null.
-
-    `to_hadoop(path)` turns a connector-style path into the Hadoop form for the read; `source_file(column)` turns
-    input_file_name() back into the connector-style path, so `_source_file` joins with the paths the messages carry.
-    """
-    from pyspark.sql import functions as F
-
-    frames = []
-    for group in groups:
-        reader = spark.read.format(fmt).options(**dict((k, spark_text(v)) for k, v in (options or {}).items()))
-        reader = reader.option("header", "true").option("inferSchema", "false")
-        frame = reader.load([to_hadoop(p) if to_hadoop else p for p in group.files])
-        columns = []
-        for src, name, kind in group.columns:
-            quoted = "`%s`" % src.replace("`", "``")
-            columns.append(F.expr("try_cast(%s AS %s)" % (quoted, kind)).alias(name))
-        origin = F.input_file_name()
-        columns.append((source_file(origin) if source_file else origin).alias(tracking_column))
-        frames.append(frame.select(*columns))
+def pairwise_union_by_name(frames, allow_missing=True):
+    """Balanced binary union avoids deeply nested Spark plans."""
     if not frames:
         return None
-    result = frames[0]
-    for other in frames[1:]:
-        result = result.unionByName(other, allowMissingColumns=True)
-    return result
+    current = list(frames)
+    while len(current) > 1:
+        next_level = []
+        for index in range(0, len(current), 2):
+            if index + 1 < len(current):
+                next_level.append(current[index].unionByName(current[index + 1], allowMissingColumns=allow_missing))
+            else:
+                next_level.append(current[index])
+        current = next_level
+    return current[0]
+
+
+def _column_groups(group):
+    columns = []
+    for name, details in (group.column_groups or {}).items():
+        kind = details.get("type", "string")
+        entries = details.get("entries", [])
+        if entries:
+            pairs = [
+                functions.struct(
+                    functions.lit(key), functions.expr("try_cast(`%s` AS %s)" % (source.replace("`", "``"), kind))
+                )
+                for source, key in entries
+            ]
+            mapped = functions.map_from_entries(functions.array(*pairs))
+            if not details.get("keep_nulls", False):
+                mapped = functions.map_filter(mapped, lambda key, value: value.isNotNull())
+            columns.append(mapped.alias(name))
+        else:
+            columns.append(functions.expr("cast(map() as map<string, %s>)" % kind).alias(name))
+    return columns
+
+
+def _frame_from_plan(
+    spark, group, fmt, options, to_hadoop, *, source_file, tracking_column, row_errors, required_set, row_index
+):
+    group_format = getattr(group, "format", None) or fmt
+    spark_format = "csv" if group_format in ("csv", "tsv") else group_format
+    group_options = dict(options or {})
+    group_options.update(getattr(group, "options", None) or {})
+    reader = spark.read.format(spark_format)
+    if spark_format == "csv":
+        reader = reader.option("header", "true").option("inferSchema", "false")
+        if group_format == "tsv" and "sep" not in group_options and "delimiter" not in group_options:
+            reader = reader.option("sep", "\t")
+    for key, value in group_options.items():
+        reader = reader.option(key, spark_text(value))
+    paths = [to_hadoop(path) if to_hadoop else path for path in group.files]
+    frame = reader.load(paths)
+    columns, error_conditions = [], []
+    for entry in group.columns:
+        src, name, *kind_values = entry
+        kind = kind_values[0] if kind_values else None
+        quoted = "`%s`" % src.replace("`", "``")
+        if kind is not None:
+            columns.append(functions.expr("try_cast(%s AS %s)" % (quoted, kind)).alias(name))
+            if row_errors:
+                condition = (
+                    "(%s IS NULL OR trim(cast(%s AS string)) = '' OR "
+                    "try_cast(%s AS %s) IS NULL)" % (quoted, quoted, quoted, kind)
+                    if name in required_set
+                    else "(%s IS NOT NULL AND trim(cast(%s AS string)) != '' AND "
+                    "try_cast(%s AS %s) IS NULL)" % (quoted, quoted, quoted, kind)
+                )
+                error_conditions.append(functions.when(functions.expr(condition), functions.lit(name)))
+        else:
+            columns.append(functions.col(src).alias(name))
+    columns.extend(_column_groups(group))
+    if row_errors:
+        errors = (
+            functions.array_compact(functions.array(*error_conditions))
+            if error_conditions
+            else functions.array().cast("array<string>")
+        )
+        columns.append(errors.alias("_row_errors"))
+    origin = functions.input_file_name()
+    if row_index is not None:
+        name, start = row_index
+        window = Window.partitionBy(origin).orderBy(functions.monotonically_increasing_id())
+        columns.append((functions.row_number().over(window) - 1 + start).cast("bigint").alias(name))
+    if group.path_vars_spec:
+        pattern, indexes = group.path_vars_spec
+        used = {entry[1] for entry in group.columns} | {tracking_column, "_row_errors"}
+        for name, index in sorted(indexes.items()):
+            if name not in used:
+                columns.append(functions.regexp_extract(origin, pattern, int(index)).alias(name))
+    columns.append((source_file(origin) if source_file else origin).alias(tracking_column))
+    return frame.select(*columns)
+
+
+def read_groups(
+    spark,
+    groups,
+    *,
+    fmt="csv",
+    options=None,
+    to_hadoop=None,
+    source_file=None,
+    tracking_column="_source_file",
+    row_errors=False,
+    required_columns=None,
+    row_index=None,
+):
+    """One lazy DataFrame per core ingest Group, combined by name."""
+    index = normalize_row_index(row_index)
+    frames = [
+        _frame_from_plan(
+            spark,
+            group,
+            fmt,
+            options,
+            to_hadoop,
+            source_file=source_file,
+            tracking_column=tracking_column,
+            row_errors=row_errors,
+            required_set=set(required_columns or ()),
+            row_index=index,
+        )
+        for group in groups
+    ]
+    return pairwise_union_by_name(frames)

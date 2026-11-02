@@ -1,90 +1,101 @@
-"""
-Finding adapters and launchers. PROPOSED.
+"""Discover Spark adapters through connector definitions."""
 
-Both adapters and launchers are plugins found through entry points. An adapter is declared in the CONNECTOR's own
-pyproject, so a provider is defined in exactly one place (its connector) and streamwright-spark holds no per-provider
-code:
+from types import MappingProxyType
 
-    # in connectors/readers/s3/pyproject.toml; `load` is a tiny lazy factory returning the adapter class
-    [project.entry-points."streamwright.spark.connectors"]
-    s3 = "streamwright.connectors.s3.spark:load"
-    # in streamwright-spark
-    [project.entry-points."streamwright.spark.launchers"]
-    emr_ec2 = "streamwright.spark.launchers.emr_ec2:EmrEc2Launcher"
+from streamwright.core.jobs.types import CONTRACT_VERSION
+from streamwright.core.runtime import plugins
+from streamwright.core.runtime.definitions import load_definition
+from streamwright.spark.runtime.definition import DefinedAdapter, bind
+from streamwright.spark.runtime.errors import RegistryError, SparkAdapterLoadError
 
-Nothing is imported until a plugin is asked for. A plugin that fails to load is reported, not fatal, so one broken
-install cannot stop `sw spark validate` for jobs that do not use it. `register()` is for tests and embedding.
-"""
+__all__ = ["GROUPS", "Registry", "RegistryError", "SparkAdapterLoadError", "available", "load", "load_all"]
 
-from importlib import metadata
+GROUPS = MappingProxyType({"adapter": plugins.CONNECTORS, "launcher": plugins.SPARK_LAUNCHERS})
 
 
-__all__ = ["GROUPS", "RegistryError", "register", "unregister", "available", "load", "load_all"]
-
-GROUPS = {"adapter": "streamwright.spark.connectors", "launcher": "streamwright.spark.launchers"}
-_REGISTERED = dict((kind, {}) for kind in GROUPS)
-_LOADED = dict((kind, {}) for kind in GROUPS)
+class UnsupportedSparkAdapterError(RegistryError):
+    """A connector exists but does not declare a Spark adapter."""
 
 
-class RegistryError(Exception):
-    pass
+class Registry:
+    def __init__(self, *, entry_points=None, adapters=None, launchers=None):
+        self.entry_points = entry_points
+        self.registered = {"adapter": dict(adapters or {}), "launcher": dict(launchers or {})}
 
+    def register(self, plugin, kind="adapter"):
+        if kind == "adapter":
+            if not isinstance(plugin, DefinedAdapter):
+                raise RegistryError("Spark adapters must come from a ConnectorDefinition")
+            name = plugin.provider
+        else:
+            name = self._validate_launcher(plugin, plugin.platform)
+        self.registered[kind][name] = plugin
 
-def _name_of(kind, plugin):
-    return plugin.provider if kind == "adapter" else plugin.platform
+    def available(self, kind="adapter"):
+        names = {entry["name"] for entry in plugins.discover(GROUPS[kind], entry_points=self.entry_points)}
+        return sorted(names | set(self.registered[kind]))
 
+    @staticmethod
+    def _validate_launcher(plugin, name):
+        required = ("check_platform", "check_lock", "preview")
+        if name != "local":
+            required += ("submit",)
+        if any(not callable(getattr(plugin, method, None)) for method in required):
+            raise RegistryError("Spark launcher does not implement its platform contract")
+        if getattr(plugin, "contract_version", None) != CONTRACT_VERSION:
+            raise RegistryError(f"Spark launcher {name!r} has incompatible contract version")
+        if not isinstance(name, str) or not name or plugin.platform != name:
+            raise RegistryError(f"Spark launcher {name!r} has an invalid platform")
+        return name
 
-def register(plugin, kind="adapter"):
-    _REGISTERED[kind][_name_of(kind, plugin)] = plugin
+    def load(self, name, kind="adapter", allow=None):
+        if allow is not None and name not in allow:
+            raise RegistryError(f"{kind} {name!r} is not in the allowed list")
+        if name in self.registered[kind]:
+            return self.registered[kind][name]
+        try:
+            if kind == "adapter":
+                definition = load_definition(name, allowed=allow, entry_points=self.entry_points)
+                if "spark" not in definition.engines:
+                    raise UnsupportedSparkAdapterError(f"connector {name!r} does not support Spark")
+                return bind(definition, name)
+            component = plugins.load_plugin(
+                plugins.SPARK_LAUNCHERS, name, allowed=allow, entry_points=self.entry_points
+            )
+        except RegistryError:
+            raise
+        except plugins.PluginError as exc:
+            raise RegistryError(str(exc)) from None
+        if not isinstance(component, type):
+            raise RegistryError(f"{kind} {name!r} must expose a class")
+        try:
+            plugin = component()
+        except Exception as exc:
+            raise RegistryError(f"{kind} {name!r} could not be initialized ({type(exc).__name__})") from None
+        self._validate_launcher(plugin, name)
+        return plugin
 
-
-def unregister(name, kind="adapter"):
-    _REGISTERED[kind].pop(name, None)
-    _LOADED[kind].pop(name, None)
-
-
-def _entry_points(group):
-    found = metadata.entry_points()
-    return list(found.select(group=group)) if hasattr(found, "select") else list(found.get(group, []))
+    def load_all(self, kind="adapter", allow=None):
+        found, problems = {}, []
+        for name in self.available(kind):
+            if allow is not None and name not in allow:
+                continue
+            try:
+                found[name] = self.load(name, kind, allow)
+            except UnsupportedSparkAdapterError:
+                continue
+            except RegistryError as exc:
+                problems.append(str(exc))
+        return found, problems
 
 
 def available(kind="adapter"):
-    """Names that can be loaded; nothing is imported."""
-    return sorted(set(_REGISTERED[kind]) | set(e.name for e in _entry_points(GROUPS[kind])))
+    return Registry().available(kind)
 
 
-def load(name, kind="adapter"):
-    if name in _REGISTERED[kind]:
-        return _REGISTERED[kind][name]
-    if name in _LOADED[kind]:
-        return _LOADED[kind][name]
-    entries = [e for e in _entry_points(GROUPS[kind]) if e.name == name]
-    if not entries:
-        raise RegistryError("%s %r is not installed (installed: %s)" % (kind, name, ", ".join(available(kind)) or "none"))
-    try:
-        loaded = entries[0].load()
-        if callable(loaded) and not isinstance(loaded, type) and not hasattr(loaded, "provider") \
-                and not hasattr(loaded, "platform"):
-            loaded = loaded()                       # a lazy factory, e.g. streamwright.connectors.s3.spark:load
-        plugin = loaded() if isinstance(loaded, type) else loaded
-    except ImportError as exc:                      # the message names the fix (e.g. pip install "streamwright-s3[spark]")
-        raise RegistryError("%s %r could not be loaded: %s" % (kind, name, exc))
-    except Exception as exc:
-        raise RegistryError("%s %r could not be loaded: %s" % (kind, name, type(exc).__name__))
-    if _name_of(kind, plugin) != name:
-        raise RegistryError("entry point %r provides %r" % (name, _name_of(kind, plugin)))
-    _LOADED[kind][name] = plugin
-    return plugin
+def load(name, kind="adapter", allow=None):
+    return Registry().load(name, kind, allow)
 
 
 def load_all(kind="adapter", allow=None):
-    """({name: plugin}, problems) for everything available, optionally limited to `allow`."""
-    found, problems = {}, []
-    for name in available(kind):
-        if allow is not None and name not in allow:
-            continue
-        try:
-            found[name] = load(name, kind)
-        except RegistryError as exc:
-            problems.append(str(exc))
-    return found, problems
+    return Registry().load_all(kind, allow)

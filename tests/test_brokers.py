@@ -1,84 +1,92 @@
-import unittest
+"""Broker hook contract: destination and polling policy stay outside the engine."""
 
-from streamwright.spark.kinds import BrokerError
-from streamwright.connectors.kafka._spark import client_conf, parse_seconds
+from types import SimpleNamespace
 
-
-class Conf(unittest.TestCase):
-    def test_msk_iam(self):
-        conf = client_conf({"bootstrap_servers": "b:9098", "security_protocol": "SASL_SSL",
-                            "sasl_mechanism": "AWS_MSK_IAM", "region": "us-east-1"})
-        self.assertEqual(conf["sasl.mechanisms"], "OAUTHBEARER")
-        self.assertEqual(conf["security.protocol"], "SASL_SSL")
-
-    def test_plain_dev(self):
-        self.assertEqual(client_conf({"bootstrap_servers": "kafka:9092"})["security.protocol"], "PLAINTEXT")
-
-    def test_rejects_unknown_values(self):
-        with self.assertRaises(BrokerError):
-            client_conf({"bootstrap_servers": "b", "security_protocol": "HTTP"})
-        with self.assertRaises(BrokerError):
-            client_conf({"bootstrap_servers": "b", "sasl_mechanism": "MD5"})
-
-    def test_seconds(self):
-        self.assertEqual(parse_seconds("30s"), 30)
-        self.assertEqual(parse_seconds("2m"), 120)
-        with self.assertRaises(BrokerError):
-            parse_seconds("soon")
+from streamwright.connectors.kafka import CONNECTOR
+from streamwright.core.jobs import BrokerCall, ExecutionResult, Message, Runner
+from streamwright.core.jobs.state import open_sqlite
+from streamwright.core.jobs.types import Broker as BrokerClient
+from streamwright.spark.cli.run import _broker_calls
+from streamwright.spark.runtime.definition import DefinedAdapter
 
 
-if __name__ == "__main__":
-    unittest.main()
+class Client(BrokerClient):
+    def __init__(self):
+        self.polled, self.published, self.acked = [], [], []
+
+    def poll_limit(self, arguments, maximum):
+        return min(maximum, arguments["page_size"])
+
+    def poll_wait_seconds(self, arguments, maximum):
+        return min(maximum, arguments["wait"])
+
+    def poll(self, arguments, limit, max_wait_seconds, watermarks=None):
+        self.polled.append((limit, max_wait_seconds))
+        return [Message("message", None, "{}", {}, None)] if len(self.polled) == 1 else []
+
+    def ack(self, messages, arguments):
+        self.acked.extend(message.message_id for message in messages)
+
+    def publish(self, arguments, events, dedupe_key):
+        self.published.append((arguments, events, dedupe_key))
+
+    def destination(self, arguments):
+        return arguments.get("address") or arguments["destination"]
 
 
-class Errors(unittest.TestCase):
-    def test_missing_topic_says_what_to_do(self):
-        from streamwright.connectors.kafka._spark import describe_error
+class EventExecutor:
+    def execute(self, context, manifest, done, hooks):
+        hooks.save_manifest(manifest)
+        return ExecutionResult(events={"published": [{"id": context.batch_id}]})
 
-        class E(object):
-            def __init__(self, name):
-                self._name = name
 
-            def name(self):
-                return self._name
-        text = describe_error(E("UNKNOWN_TOPIC_OR_PART"), "lake.file_arrived.v1")
-        self.assertIn("does not exist", text)
-        self.assertIn("lake.file_arrived.v1", text)
-        self.assertEqual(describe_error(E("_TRANSPORT"), "t"), "kafka error: _TRANSPORT")
+def test_core_runner_uses_adapter_policy_and_destination(tmp_path):
+    store = open_sqlite(str(tmp_path / "events.db"))
+    store.initialize()
+    client = Client()
+    consumer = BrokerCall(client, {"page_size": 4, "wait": 2})
+    publisher = BrokerCall(client, {"address": "destination"})
+    assert client.destination(publisher.arguments) == "destination"
+    runner = Runner("events", store, EventExecutor(), consumer=consumer, publishers={"published": publisher})
+    assert runner.run(max_messages=50, max_wait=20) == 0
+    assert client.polled == [(4, 2)]
+    assert client.acked == ["message"]
+    assert client.published[0][0]["address"] == "destination"
 
-    def test_auto_offset_reset_validation(self):
-        from streamwright.connectors.kafka._spark import KafkaClient
-        client = KafkaClient({"bootstrap_servers": "localhost:9092"})
-        with self.assertRaises(BrokerError) as ctx:
-            client.poll({"group.id": "grp", "topic": "top", "auto.offset.reset": "invalid_val"}, 10, 1)
-        self.assertIn("auto.offset.reset must be 'earliest' or 'latest'", str(ctx.exception))
 
-    def test_kafka_vendor_keys_accepted(self):
-        from streamwright.connectors.kafka._spark import KafkaSpark
-        spark_kafka = KafkaSpark()
-        method = spark_kafka.method("topic", "consume")
-        self.assertIn("group.id", method.arguments)
-        self.assertIn("auto.offset.reset", method.arguments)
-        self.assertIn("max.poll.records", method.arguments)
-        self.assertIn("fetch.max.wait.ms", method.arguments)
-        self.assertIn("options", method.arguments)
-        # Check validation accepts standard vendor keys
-        problems = spark_kafka.check_call(method, {"topic": "my_top", "group.id": "my_grp", "auto.offset.reset": "latest",
-                                                   "max.poll.records": 100, "options": {"session.timeout.ms": 30000}})
-        self.assertEqual(problems, [])
+def test_spark_opens_both_calls_from_one_connector_definition():
+    client = Client()
 
-    def test_sqs_vendor_keys_accepted(self):
-        from streamwright.connectors.sqs._spark import SqsSpark
-        spark_sqs = SqsSpark()
-        method = spark_sqs.method("queue", "consume")
-        self.assertIn("QueueUrl", method.arguments)
-        self.assertIn("MaxNumberOfMessages", method.arguments)
-        self.assertIn("WaitTimeSeconds", method.arguments)
-        self.assertIn("VisibilityTimeout", method.arguments)
-        self.assertIn("options", method.arguments)
-        # Check validation accepts standard vendor keys
-        problems = spark_sqs.check_call(method, {"QueueUrl": "https://sqs.us-east-1.amazonaws.com/123/q",
-                                                 "MaxNumberOfMessages": 10, "WaitTimeSeconds": 20,
-                                                 "VisibilityTimeout": 60, "options": {"foo": "bar"}})
-        self.assertEqual(problems, [])
+    class Adapter:
+        def open_broker(self, connection):
+            assert connection["bootstrap_servers"] == "broker:9092"
+            return client
 
+    job = {
+        "connections": {"bus": {"provider": "kafka"}},
+        "steps": [
+            {
+                "connection": "bus",
+                "service": "message",
+                "method": "consume",
+                "arguments": {"destination": "arrivals", "group_id": "workers"},
+            }
+        ],
+        "outputs": [
+            {
+                "name": "notice",
+                "connection": "bus",
+                "service": "message",
+                "method": "publish",
+                "arguments": {"destination": "commits"},
+            }
+        ],
+    }
+    consumer, publishers = _broker_calls(
+        job,
+        {"bus": SimpleNamespace(provider="kafka", auth={"bootstrap_servers": "broker:9092"})},
+        {"kafka": DefinedAdapter(CONNECTOR, Adapter())},
+    )
+    assert consumer.broker is client
+    assert publishers["notice"].broker is client
+    assert publishers["notice"].broker.destination(publishers["notice"].arguments) == "commits"

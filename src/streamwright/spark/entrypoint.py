@@ -30,4 +30,4 @@ if __name__ == "__main__":
     _bootstrap_wheels()
     from streamwright.spark.cli import main
 
-    raise SystemExit(main(["run", "--driver"] + sys.argv[1:]))
+    raise SystemExit(main(["run", "--driver", *sys.argv[1:]]))

@@ -1,0 +1,75 @@
+# ==============================================================================
+# Docker Compose Overlay for s3_partner_orders
+# ------------------------------------------------------------------------------
+# Usage:
+#   sw spark run partner_orders.yaml --overlay partner_orders.docker.yaml
+#
+# Role & Mechanics:
+#   Overlays allow running the exact same production pipeline in Docker Compose
+#   without modifying the base `partner_orders.yaml`. StreamWright shallow-merges top-level
+#   sections (`connections`, `runtime`, `spec`), overriding production AWS and RDS
+#   endpoints with local container service names.
+# ==============================================================================
+
+connections:
+  # ----------------------------------------------------------------------------
+  # Redirect AWS S3 landing requests to LocalStack inside Docker network
+  # ----------------------------------------------------------------------------
+  landing_s3:
+    endpoint: "localstack:4566"
+    url_style: path
+    use_ssl: false
+    key_id: "{{ secrets.s3_key_id }}"
+    secret: "{{ secrets.s3_secret }}"
+
+  # ----------------------------------------------------------------------------
+  # Redirect AWS S3 lake requests to LocalStack inside Docker network
+  # ----------------------------------------------------------------------------
+  lake_s3:
+    endpoint: "localstack:4566"
+    url_style: path
+    use_ssl: false
+    key_id: "{{ secrets.s3_key_id }}"
+    secret: "{{ secrets.s3_secret }}"
+
+  # Delta Lake table inherits the redirected lake_s3 credentials
+  lake_delta: {}
+
+  # ----------------------------------------------------------------------------
+  # Redirect PostgreSQL databases to local Docker container 'postgres'
+  # ----------------------------------------------------------------------------
+  audit_db:
+    host: postgres
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+  ops_db:
+    host: postgres
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+spec:
+  secrets:
+    s3_key_id: {type: string}
+    s3_secret: {type: string}
+
+runtime:
+  # Disable AWS Secrets Manager resolution in local Docker testing
+  secrets: null
+  artifacts: null
+
+  # Execute on local Spark engine inside container
+  platform:
+    type: local
+
+  spark:
+    conf:
+      # Local disk directory for Catalyst query plan lineage checkpointing
+      spark.checkpoint.dir: "/tmp/spark_checkpoints"
+      spark.dynamicAllocation.enabled: "false"
+      spark.sql.catalogImplementation: "hive"
+      # Hive Metastore Thrift endpoint inside Docker Compose network
+      spark.hadoop.hive.metastore.uris: "thrift://metastore:9083"
+

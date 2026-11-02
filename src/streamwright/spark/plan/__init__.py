@@ -1,5 +1,5 @@
-"""The execution plan of a job (dependencies, Spark actions, recomputation hazards). PROPOSED."""
+"""Spark action and caching analysis on the shared jobs plan."""
 
-from streamwright.spark.plan.graph import Node, Plan, build_plan, role_of
+from streamwright.spark.plan.analysis import Node, Plan, build_plan, role_of
 
 __all__ = ["Node", "Plan", "build_plan", "role_of"]

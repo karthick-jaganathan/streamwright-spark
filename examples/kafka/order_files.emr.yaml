@@ -1,0 +1,48 @@
+# ==============================================================================
+# AWS EMR on EC2 Overlay (Cluster Execution)
+# ==============================================================================
+# Submits the job as a step to an existing Amazon EMR cluster.
+#
+# Usage:
+#   sw spark run examples/kafka/order_files.yaml \
+#     --overlay examples/kafka/order_files.emr.yaml \
+#     --set kafka_bootstrap=b-1.msk.us-east-1.amazonaws.com:9098 \
+#     --set lake_bucket=my-corp-lake \
+#     --dry-run
+# ==============================================================================
+
+connections:
+  # Route Kafka bus to AWS MSK with IAM authentication
+  bus:
+    security_protocol: SASL_SSL
+    sasl_mechanism: AWS_MSK_IAM
+    region: us-east-1
+
+  # S3 endpoints default to standard AWS S3
+  landing:
+    endpoint: null
+    url_style: null
+    use_ssl: true
+
+  lake:
+    endpoint: null
+    url_style: null
+    use_ssl: true
+
+runtime:
+  platform:
+    type: emr_ec2
+    region: us-east-1
+    cluster:
+      id: j-1234567890ABCDEF
+    staging: s3://my-corp-lake/streamwright/staging/
+    deploy_mode: cluster
+    step:
+      action_on_failure: CONTINUE
+  spark:
+    conf:
+      spark.checkpoint.dir: "s3://{{ config.lake_bucket }}/checkpoints/spark_lineage/"
+      spark.dynamicAllocation.enabled: "true"
+      spark.dynamicAllocation.maxExecutors: "50"
+      spark.executor.memory: 8g
+      spark.executor.cores: "4"

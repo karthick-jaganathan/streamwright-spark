@@ -1,11 +1,10 @@
-"""Config and secret values for a run, through streamwright core's own input handling. PROPOSED."""
+"""Config and secret values for a run, through core input handling."""
 
-import os
+from importlib import import_module
 
 from streamwright.core.config import inputs as core_inputs
-
+from streamwright.core.jobs import inputs as job_inputs
 from streamwright.spark.cli.common import err, parse_set
-
 
 __all__ = ["InputError", "config_values", "secret_values"]
 
@@ -15,12 +14,9 @@ InputError = core_inputs.InputError
 def config_values(job, args):
     provided = {}
     if args.config:
-        values, streams = core_inputs.read_config_file(args.config)
-        if streams:
-            raise InputError("%r: `streams` does not apply to a SparkJob" % args.config)
-        provided.update(values)
+        provided.update(job_inputs.read_config_values(args.config))
     provided.update(parse_set(args.set))
-    return core_inputs.resolve_inputs((job.get("spec") or {}).get("config"), provided, "config")
+    return job_inputs.effective_config(job, provided)
 
 
 def secret_values(job, args):
@@ -33,21 +29,12 @@ def secret_values(job, args):
         provided.setdefault(name, value)
     source = (job.get("runtime") or {}).get("secrets") or {}
     if source.get("source") == "aws_secretsmanager" and len(set(provided) & set(declared)) < len(declared):
-        for name, value in _aws_secrets(source, job).items():
+        try:
+            aws_secrets = import_module("streamwright.spark.cli.aws_secrets")
+        except ImportError as exc:
+            if exc.name != "boto3":
+                raise
+            raise InputError('boto3 is not installed; pip install "streamwright-spark[emr]"') from exc
+        for name, value in aws_secrets.read_secrets(source, job).items():
             provided.setdefault(name, value)
-    return core_inputs.resolve_inputs(declared, provided, "secrets", hide_values=True)
-
-
-def _aws_secrets(source, job):
-    import json
-    try:
-        import boto3
-    except ImportError:
-        raise InputError("boto3 is not installed; pip install \"streamwright-spark[emr]\"")
-    region = ((job.get("runtime") or {}).get("platform") or {}).get("region")
-    reply = boto3.client("secretsmanager", region_name=region).get_secret_value(SecretId=source["id"])
-    try:
-        data = json.loads(reply["SecretString"])
-    except ValueError:
-        raise InputError("the secret %s is not a JSON object" % source["id"])
-    return data if isinstance(data, dict) else {}
+    return job_inputs.secret_values(job, provided)

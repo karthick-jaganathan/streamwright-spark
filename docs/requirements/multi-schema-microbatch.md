@@ -27,14 +27,14 @@ dropped or rejected.
 - Rejected files go to the runtime view `_file_errors` (see `engine/executor.py` `_runtime_tables`); the example job writes
   them to `bronze_rejects`.
 - `check_read` requires explicit `format: csv|tsv` with `columns` (`format: auto` is rejected).
-- Not exercised on Spark: `read_groups`, `rt.first_line`, `rt.exists`. The Docker seed (`docker/seed.sh`) is the first
+- Not exercised on Spark: `read_groups`, `rt.first_line`, `rt.exists`. The Docker seed (`docker/seed_order_files.sh`) is the first
   test data (clientA and clientB with different headers, clientC unmapped).
 
 ### Gaps
 
 | ID | Gap | Evidence | Severity |
 |----|-----|----------|----------|
-| G1 | A plain read (no `columns:`) of several files assumes one schema. For CSV, Spark is expected to name columns from one header and assign the others by position, so a client with reordered or renamed columns is silently misaligned. For parquet the schema may come from one file (`mergeSchema` is off by default). **Verify the exact Spark behaviour in a spike first.** | `read_objects`, the `columns is None` branch (`spark.read...load([paths])`); `examples/s3_events_to_delta/job.yaml` step `file_contents` reads `{{ distinct_files.file_uri }}` this way and `processed_orders` assumes `order_id, client_id, item_name, amount, event_ts` | High: silent data corruption |
+| G1 | A plain read (no `columns:`) of several files assumes one schema. For CSV, Spark is expected to name columns from one header and assign the others by position, so a client with reordered or renamed columns is silently misaligned. For parquet the schema may come from one file (`mergeSchema` is off by default). **Verify the exact Spark behaviour in a spike first.** | `read_objects`, the `columns is None` branch (`spark.read...load([paths])`); `examples/kafka/order_files.yaml` step `file_contents` reads `{{ distinct_files.file_uri }}` this way and `processed_orders` assumes `order_id, client_id, item_name, amount, event_ts` | High: silent data corruption |
 | G2 | The format is decided from the first path only, so a batch mixing `.csv` and `.parquet` (or `.csv` and `.json`) reads every file with the first file's format. | `read_objects`: `_format_of(paths[0], ...)` | High |
 | G3 | The mapping path supports CSV/TSV only. JSON/JSONL/parquet have no rename/cast mapping. | `check_read`; `read_groups(..., "csv", ...)` hard-coded in `read_objects` | Medium |
 | G4 | No schema-drift visibility. Unmapped columns are dropped silently, a client adding a column is never reported. | `plan_groups` ("Unmapped columns are dropped") | Medium |
@@ -42,7 +42,7 @@ dropped or rejected.
 | G6 | Not replay-stable. Mapping rows are pinned in the manifest (`rt.expand` -> `pinned`), but file existence (`rt.exists`) and header lines (`rt.first_line`) are not. After a crash, a replay can build different groups if a file changed or vanished. | `engine/runtime.py` (`pinned`, `exists`, `first_line`) | Medium: breaks the delivery guarantee the project promises |
 | G7 | Driver-side cost is O(files) sequential Hadoop calls (`exists` per path, `first_line` per path) with S3 latency. `max_messages` defaults to 500. | `read_objects` loops | Medium |
 | G8 | `unionByName` over up to `limits.read_groups` (200) frames builds a deep left-leaning plan. | `read_groups` | Low/Medium (stack depth, planning time) |
-| G9 | No schema-evolution policy for the output tables: what happens when the canonical vocabulary gains a column. | `kinds/delta.py` (`options` pass-through only); `examples/s3_events_to_delta/job.yaml` line ~285 sets `mergeSchema` ad hoc | Medium |
+| G9 | No schema-evolution policy for the output tables: what happens when the canonical vocabulary gains a column. | `kinds/delta.py` (`options` pass-through only); `examples/kafka/order_files.yaml` line ~285 sets `mergeSchema` ad hoc | Medium |
 | G10 | Only header-bearing files are supported (no headerless files, no per-client delimiter/encoding). | `read_groups` forces `header=true`; one `options` dict for the whole read | Low |
 
 ## 3. Invariants that must keep holding
@@ -176,7 +176,7 @@ Without `columns:`, a multi-file read of CSV/TSV must not rely on one file's hea
 
 - `README.md` and `cookbook/` get a "multi-schema batches" page: the three modes (plain by name, strict, mapped), the
   runtime views `_file_errors` and `_schema_report`, the limits, and the replay rule.
-- Update `examples/s3_events_to_delta/job.yaml` so `file_contents` states `schema_mode` explicitly, and add the
+- Update `examples/kafka/order_files.yaml` so `file_contents` states `schema_mode` explicitly, and add the
   required-columns check it relies on.
 
 ## 5. Suggested order
@@ -185,7 +185,7 @@ Without `columns:`, a multi-file read of CSV/TSV must not rely on one file's hea
 2. R6 (plan pinning) together with R1/R2, because it changes where planning lives.
 3. R4 (reports), R11 (docs). 4. R7. 5. R3, R5. 6. R8, R9, R10.
 
-## 6. Test data and expected results (extend `docker/seed.sh`)
+## 6. Test data and expected results (extend `docker/seed_order_files.sh`)
 
 Keep the existing five messages and add (new files under `acme-landing`):
 
@@ -196,7 +196,7 @@ Keep the existing five messages and add (new files under `acme-landing`):
 | `clientB/orders_20261018.csv` | `Revenue` contains `n/a` on one row | 1 row with `revenue` null and `_row_errors = [revenue]` (R5) |
 | `clientE/events.parquet` and `clientE/events.csv` in one message batch | two formats | both read (R2); a mapping for clientE is added to `docker/postgres-init.sql` |
 
-The acceptance run: `make down && make up && make seed`, then the documented `docker compose run --rm sw run ... --drain`;
+The acceptance run: `make down && make up && make seed-order-files`, then the documented `docker compose run --rm sw run ... --drain`;
 afterwards `sw spark state show` shows one completed batch and the report outputs contain the rows above. Report any
 deviation; do not adjust the expectations to match the output without saying so.
 

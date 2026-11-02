@@ -1,1 +1,1 @@
-"""Storage helpers shared by the object-store adapters: path safety, file naming, split exports, column mapping. PROPOSED."""
+"""Spark file helpers: path safety, split exports, and DataFrame materialization."""

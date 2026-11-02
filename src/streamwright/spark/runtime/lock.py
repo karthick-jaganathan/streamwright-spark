@@ -1,5 +1,5 @@
 """
-The version lock: one file that pins everything the job runs with. PROPOSED.
+The version lock: one file that pins everything the job runs with.
 
     {"lock_version": 1, "job": ..., "spark": "3.5.3", "python": "3.10",
      "packages": {"delta-spark": "3.2.1", ...},
@@ -15,24 +15,33 @@ can be checked against the same fingerprint. A mismatch stops the job before any
 import hashlib
 import json
 import sys
+from importlib import metadata
 
+__all__ = ["LockError", "build_lock", "check_lock", "dump", "fingerprint", "load"]
 
-__all__ = ["LockError", "build_lock", "fingerprint", "check_lock", "dump", "load"]
 
 class LockError(Exception):
     pass
 
 
 def _installed(name):
-    from importlib import metadata
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
 
 
-def build_lock(job_name, adapters_used, spark, extra_jars=None, emr_release=None, python_env=None, image=None,
-               installed=_installed):
+def build_lock(
+    job_name,
+    adapters_used,
+    spark,
+    *,
+    extra_jars=None,
+    emr_release=None,
+    python_env=None,
+    image=None,
+    installed=_installed,
+):
     """Pins what the job runs with. Each adapter reports its own packages and jars: there is no table in core."""
     minor = ".".join(spark.split(".")[:2])
     packages, jars, missing = {"streamwright-spark": installed("streamwright-spark") or "0.0.0"}, [], []
@@ -53,8 +62,14 @@ def build_lock(job_name, adapters_used, spark, extra_jars=None, emr_release=None
                     jars.append(entry)
     if missing:
         raise LockError("cannot lock: " + "; ".join(missing))
-    lock = {"lock_version": 1, "job": job_name, "spark": spark, "python": "%d.%d" % sys.version_info[:2],
-            "packages": dict(sorted(packages.items())), "jars": sorted(jars, key=lambda j: j["coordinates"])}
+    lock = {
+        "lock_version": 1,
+        "job": job_name,
+        "spark": spark,
+        "python": "%d.%d" % sys.version_info[:2],
+        "packages": dict(sorted(packages.items())),
+        "jars": sorted(jars, key=lambda j: j["coordinates"]),
+    }
     if emr_release:
         lock["emr"] = {"release_label": emr_release}
     if python_env:
@@ -73,9 +88,12 @@ def check_lock(lock, spark_version, python=None, installed=_installed, emr_relea
     problems = []
     if lock.get("lock_version") != 1:
         problems.append("unsupported lock_version %r" % lock.get("lock_version"))
-    if ".".join(str(spark_version).split(".")[:3]) != lock.get("spark") and not str(lock.get("spark", "")).endswith("x"):
-        if str(spark_version) != lock.get("spark"):
-            problems.append("Spark is %s, the lock says %s" % (spark_version, lock.get("spark")))
+    if (
+        ".".join(str(spark_version).split(".")[:3]) != lock.get("spark")
+        and not str(lock.get("spark", "")).endswith("x")
+        and str(spark_version) != lock.get("spark")
+    ):
+        problems.append("Spark is %s, the lock says %s" % (spark_version, lock.get("spark")))
     python = python or "%d.%d" % sys.version_info[:2]
     if python != lock.get("python"):
         problems.append("Python is %s, the lock says %s" % (python, lock.get("python")))
@@ -97,12 +115,12 @@ def dump(lock, path):
 
 def load(path):
     try:
-        with open(path, "r", encoding="utf-8") as stream:
+        with open(path, encoding="utf-8") as stream:
             data = json.load(stream)
-    except (IOError, OSError) as exc:
-        raise LockError("cannot read lock %r: %s" % (path, exc.strerror or "error"))
+    except OSError as exc:
+        raise LockError("cannot read lock %r: %s" % (path, exc.strerror or "error")) from exc
     except ValueError:
-        raise LockError("lock %r is not valid JSON" % path)
+        raise LockError("lock %r is not valid JSON" % path) from None
     if not isinstance(data, dict):
         raise LockError("lock %r must be an object" % path)
     return data

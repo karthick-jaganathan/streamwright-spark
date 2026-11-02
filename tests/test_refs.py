@@ -1,7 +1,18 @@
 import datetime
 import unittest
 
-from streamwright.spark.runtime.refs import RefError, sql_literal, substitute
+from streamwright.core.jobs.refs import RefError
+from streamwright.core.jobs.refs import sql_literal as core_sql_literal
+from streamwright.core.jobs.refs import substitute as core_substitute
+from streamwright.spark.io.sql import quote_literal as spark_quote
+
+
+def sql_literal(value):
+    return core_sql_literal(value, quote_text=spark_quote)
+
+
+def substitute(text, values, batch_id, batch_ts, limit):
+    return core_substitute(text, values, {"batch.id": batch_id, "batch.ts": batch_ts}, limit, quote_text=spark_quote)
 
 
 class Literals(unittest.TestCase):
@@ -27,8 +38,10 @@ class Substitute(unittest.TestCase):
     def test_lists_and_batch(self):
         values = {("t", "event_date"): [datetime.date(2026, 10, 16), datetime.date(2026, 10, 17)], ("t", "c"): []}
         text = "target.d IN ({{ t.event_date }}) AND target.c IN ({{ t.c }}) AND b = {{ batch.id }}"
-        self.assertEqual(substitute(text, values, "b1", "ts", 10),
-                         "target.d IN (DATE '2026-10-16', DATE '2026-10-17') AND target.c IN (NULL) AND b = 'b1'")
+        self.assertEqual(
+            substitute(text, values, "b1", "ts", 10),
+            "target.d IN (DATE '2026-10-16', DATE '2026-10-17') AND target.c IN (NULL) AND b = 'b1'",
+        )
 
     def test_cap(self):
         with self.assertRaises(RefError):

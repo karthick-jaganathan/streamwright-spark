@@ -139,13 +139,14 @@ steps:
   # ============================================================================
   - name: arrivals
     connection: bus
-    service: topic
+    service: message
     method: consume
     arguments:
-      topic: lake.file_arrived.v1
-      group.id: streamwright-bronze-client-orders
-      auto.offset.reset: earliest
-      max.poll.records: 500
+      destination: lake.file_arrived.v1
+      group_id: streamwright-bronze-client-orders
+      options:
+        auto.offset.reset: earliest
+        max.poll.records: 500
       max_wait: 30s
     sql: |
       SELECT
@@ -219,10 +220,11 @@ outputs:
   # ============================================================================
   - name: bronze_orders
     connection: lake_delta
-    service: tables
-    method: merge
+    service: table
+    method: write
     arguments:
-      table_path: "s3://{{ config.lake_bucket }}/bronze/orders"
+      mode: merge
+      path: "s3://{{ config.lake_bucket }}/bronze/orders"
       partition_by: [event_date]
       condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
       target_predicate: "target.event_date IN ({{ tagged_orders.event_date }})"
@@ -240,10 +242,10 @@ outputs:
   # ============================================================================
   - name: bronze_rejects
     connection: lake_delta
-    service: tables
-    method: append
+    service: table
+    method: write
     arguments:
-      table_path: "s3://{{ config.lake_bucket }}/bronze/rejects"
+      path: "s3://{{ config.lake_bucket }}/bronze/rejects"
     sql: |
       SELECT message_id, file_uri AS path, _error AS reason, :batch_id AS batch_id
       FROM arrivals
@@ -280,10 +282,11 @@ outputs:
   - name: ingest_audit
     connection: reporting_db
     service: database
-    method: upsert
+    method: write
     arguments:
+      mode: merge
       table: reporting.ingest_audit
-      key: [batch_id, client_id]
+      primary_key: [batch_id, client_id]
       update: [row_count, revenue]
       staging_table: reporting.ingest_audit_stg
     sql: |
@@ -302,10 +305,10 @@ outputs:
   # ============================================================================
   - name: announce
     connection: bus
-    service: topic
+    service: message
     method: publish
     arguments:
-      topic: lake.bronze.committed.v1
+      destination: lake.bronze.committed.v1
       key: table_name
     sql: "SELECT table_name, version, rows, batch_id FROM _commits WHERE output = 'bronze_orders'"
 

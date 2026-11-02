@@ -23,9 +23,16 @@ AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
   aws --endpoint-url=http://127.0.0.1:4566 s3 cp src/streamwright/spark/entrypoint.py s3://code-bucket/entrypoint.py
 
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
-  aws --endpoint-url=http://127.0.0.1:4566 s3 cp examples/s3_events_to_delta/job.yaml s3://code-bucket/jobs/s3_events_to_delta/job.yaml
+  aws --endpoint-url=http://127.0.0.1:4566 s3 cp examples/kafka/order_files.yaml s3://code-bucket/jobs/kafka/order_files.yaml
 
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
-  aws --endpoint-url=http://127.0.0.1:4566 s3 cp overlays/docker.yaml s3://code-bucket/jobs/s3_events_to_delta/overlay.yaml
+  aws --endpoint-url=http://127.0.0.1:4566 s3 cp examples/kafka/order_files.docker.yaml s3://code-bucket/jobs/kafka/order_files.docker.yaml
+
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
+  aws --endpoint-url=http://127.0.0.1:4566 s3 cp examples/s3/partner_orders.yaml s3://code-bucket/jobs/s3/partner_orders.yaml
+
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
+  aws --endpoint-url=http://127.0.0.1:4566 s3 cp examples/s3/partner_orders.docker.yaml s3://code-bucket/jobs/s3/partner_orders.docker.yaml
 
 echo "==> All artifacts published successfully to s3://code-bucket!"
+

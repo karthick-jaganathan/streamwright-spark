@@ -1,0 +1,66 @@
+# ==============================================================================
+# Host Local Overlay for s3_partner_orders (Run on macOS / host Python)
+# ------------------------------------------------------------------------------
+# Usage:
+#   sw spark run partner_orders.yaml --overlay partner_orders.local.yaml
+#
+# Role & Mechanics:
+#   Enables rapid local development directly from your workstation's terminal/IDE.
+#   While background services (LocalStack, Postgres, Hive Metastore) run in Docker,
+#   this overlay directs the local Python driver to communicate with localhost (`127.0.0.1`)
+#   published ports.
+# ==============================================================================
+
+connections:
+  # ----------------------------------------------------------------------------
+  # Connect to LocalStack S3 published on localhost:4566
+  # ----------------------------------------------------------------------------
+  landing_s3:
+    endpoint: "127.0.0.1:4566"
+    url_style: path
+    use_ssl: false
+
+  # ----------------------------------------------------------------------------
+  # Connect to LocalStack Lake S3 published on localhost:4566
+  # ----------------------------------------------------------------------------
+  lake_s3:
+    endpoint: "127.0.0.1:4566"
+    url_style: path
+    use_ssl: false
+
+  lake_delta: {}
+
+  # ----------------------------------------------------------------------------
+  # Connect to PostgreSQL published on localhost:5432
+  # ----------------------------------------------------------------------------
+  audit_db:
+    host: 127.0.0.1
+    port: 5432
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+  ops_db:
+    host: 127.0.0.1
+    port: 5432
+    database: streamwright
+    user: sw
+    sslmode: disable
+
+runtime:
+  secrets: null
+  artifacts: null
+
+  # Execute in local PySpark process on host machine
+  platform:
+    type: local
+
+  spark:
+    conf:
+      # Checkpoint directory on local workstation filesystem
+      spark.checkpoint.dir: "/tmp/spark_checkpoints"
+      spark.dynamicAllocation.enabled: "false"
+      spark.sql.catalogImplementation: "hive"
+      # Connect to Hive Metastore published on localhost:9083
+      spark.hadoop.hive.metastore.uris: "thrift://127.0.0.1:9083"
+

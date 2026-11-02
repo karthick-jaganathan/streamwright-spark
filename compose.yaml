@@ -1,7 +1,7 @@
 # PROPOSED test environment (not started yet: no docker in the authoring sandbox).
 # Copy .env.example to .env first. Every port is bound to 127.0.0.1. Credentials are test-only and come from .env.
 #   docker compose up -d --wait
-#   docker compose run --rm sw validate /work/examples/s3_events_to_delta --overlay /work/overlays/docker.yaml --analyze
+#   docker compose run --rm sw validate /work/examples/kafka/order_files.yaml --overlay /work/examples/kafka/order_files.docker.yaml --analyze
 services:
   postgres:
     image: postgres:16.4-alpine
@@ -75,6 +75,8 @@ services:
       STREAMWRIGHT_SECRET_S3_SECRET: ${LOCALSTACK_SECRET:?copy .env.example to .env}
       STREAMWRIGHT_SECRET_AWS_ACCESS_KEY_ID: ${LOCALSTACK_KEY_ID:?copy .env.example to .env}
       STREAMWRIGHT_SECRET_AWS_SECRET_ACCESS_KEY: ${LOCALSTACK_SECRET:?copy .env.example to .env}
+      AWS_ACCESS_KEY_ID: ${LOCALSTACK_KEY_ID:?copy .env.example to .env}
+      AWS_SECRET_ACCESS_KEY: ${LOCALSTACK_SECRET:?copy .env.example to .env}
     volumes:
       - ./examples:/work/examples:ro
       - ./overlays:/work/overlays:ro

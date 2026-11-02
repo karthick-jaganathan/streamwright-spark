@@ -1,33 +1,31 @@
-"""The SparkSession, configured from runtime.spark.conf and what each adapter needs. PROPOSED. Not run yet."""
+"""The SparkSession, configured from runtime.spark.conf and each adapter's hooks."""
 
+import contextlib
 import socket
 
-from streamwright.spark.storage.paths import REDACTION_REGEX
+from pyspark.sql import SparkSession
 
+from streamwright.spark.storage.paths import REDACTION_REGEX
 
 __all__ = ["build_session", "hadoop_settings", "resolve_driver_host", "resolve_spark_metadata"]
 
 
 def hadoop_settings(connections, adapters):
-    """{fs.* key: value} from every connection's own adapter. Credentials land in the session conf, which Spark redacts."""
+    """{fs.* key: value} from every connection's own adapter, excluding inline secrets."""
     conf = {}
     for conn in connections.values():
-        conf.update(adapters[conn.provider].hadoop_conf(conn.auth))
+        adapter = adapters[conn.provider]
+        settings = adapter.hadoop_settings(conn.name, conn.auth)
+        secrets = [str(conn.auth[key]) for key in adapter.secret_keys if conn.auth.get(key)]
+        if any(secret in str(value) for secret in secrets for value in settings.values()):
+            raise ValueError(
+                "%s credentials cannot be placed in Spark conf; use the platform credential chain" % conn.provider
+            )
+        conf.update(settings)
     return conf
 
 
-LOCAL_PACKAGES = {
-    "deltalake": ["io.delta:delta-spark_2.12:3.2.1"],
-    "postgres": ["org.postgresql:postgresql:42.7.4"],
-    "s3": ["org.apache.hadoop:hadoop-aws:3.3.4", "com.amazonaws:aws-java-sdk-bundle:1.12.262"],
-    "gcs": ["com.google.cloud.bigdataoss:gcs-connector:hadoop3-2.2.22"],
-    "azure_blob": ["org.apache.hadoop:hadoop-azure:3.3.4"],
-}
-
-
 def build_session(job, connections, adapters, local=False, log_level=None):
-    from pyspark.sql import SparkSession
-
     runtime = job["runtime"]["spark"]
     builder = SparkSession.builder.appName(runtime.get("app_name") or job["name"])
     for key, value in (runtime.get("conf") or {}).items():
@@ -35,10 +33,10 @@ def build_session(job, connections, adapters, local=False, log_level=None):
     builder = builder.config("spark.redaction.regex", REDACTION_REGEX)
     for key, value in hadoop_settings(connections, adapters).items():
         builder = builder.config("spark.hadoop." + key, value)
-    if local:                                    # elsewhere the launcher owns these keys (and the jars they need)
+    if local:  # elsewhere the launcher owns these keys (and the jars they need)
         needed_packages = set()
         for conn in connections.values():
-            for pkg in LOCAL_PACKAGES.get(conn.provider, []):
+            for pkg in adapters[conn.provider].local_packages():
                 needed_packages.add(pkg)
             for key, value in adapters[conn.provider].local_conf().items():
                 builder = builder.config(key, value)
@@ -91,9 +89,7 @@ def resolve_driver_host(spark):
 def resolve_spark_metadata(spark):
     """(app_id, driver_host): Returns Spark applicationId and resolved driver host FQDN/IP."""
     app_id = None
-    try:
+    with contextlib.suppress(Exception):
         app_id = spark.sparkContext.applicationId
-    except Exception:
-        pass
     driver_host = resolve_driver_host(spark)
     return app_id, driver_host

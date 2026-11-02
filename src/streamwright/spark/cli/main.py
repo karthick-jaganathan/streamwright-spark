@@ -1,5 +1,5 @@
 """
-`sw spark ...` (PROPOSED). Entry points `streamwright-spark` / `sw-spark`; attaching it to `streamwright` core is a lazy
+`sw spark ...`. Entry points `streamwright-spark` / `sw-spark`; attaching it to `streamwright` core is a lazy
 dispatch like `streamwright mcp` (see README). Exit codes: 0 ok, 1 failed, 2 usage/validation, 130 interrupted.
 
     sw spark validate PATH... [--config F] [--set K=V] [--overlay F] [--analyze] [--graph] [--strict] [--lock F]
@@ -18,25 +18,33 @@ from streamwright.spark.cli.inputs import InputError
 from streamwright.spark.job import JobError
 from streamwright.spark.runtime.lock import LockError
 
-
 __all__ = ["main"]
 
-_COMMANDS = (("validate", validate, "check job files without Spark, brokers or credentials", True),
-             ("run", run, "run a job", False),
-             ("lock", lock, "write or check the version lock", False),
-             ("state", state, "inspect and repair bookkeeping", None))
+_COMMANDS = (
+    ("validate", validate, "check jobs without Spark, brokers or credentials", True),
+    ("plan", validate, "show Spark actions and step dependencies without running the job", True),
+    ("run", run, "run a job", False),
+    ("lock", lock, "write or check the version lock", False),
+    ("state", state, "inspect and repair bookkeeping", None),
+)
 
 
 def _parser():
-    parser = argparse.ArgumentParser(prog="sw spark", description="Spark jobs for StreamWright (proposed).")
+    parser = argparse.ArgumentParser(prog="sw spark", description="Spark jobs for StreamWright.")
     sub = parser.add_subparsers(dest="command")
     for name, module, help_text, many in _COMMANDS:
         command = sub.add_parser(name, help=help_text)
         if many is not None:
             add_job_arguments(command, many)
         module.add_arguments(command)
-        command.set_defaults(handler=module.run)
+        command.set_defaults(handler=_run_plan if name == "plan" else module.run)
     return parser
+
+
+def _run_plan(args):
+    args.analyze = True
+    args.graph = True
+    return validate.run(args)
 
 
 def _normalize_job_args(args):
@@ -51,7 +59,12 @@ def _normalize_job_args(args):
             return False
 
     if hasattr(args, "flag_jobs"):
-        jobs = list(args.job or []) + list(args.flag_jobs or []) + list(getattr(args, "flag_files", None) or []) + list(getattr(args, "flag_pipelines", None) or [])
+        jobs = (
+            list(args.job or [])
+            + list(args.flag_jobs or [])
+            + list(getattr(args, "flag_files", None) or [])
+            + list(getattr(args, "flag_pipelines", None) or [])
+        )
         if not jobs:
             err("error: at least one job path is required (pass PATH positional argument or --job PATH)")
             return False

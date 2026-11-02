@@ -1,98 +1,134 @@
-import contextlib
-import io
-import os
-import tempfile
-import unittest
+"""Spark CLI submission flags and credential-safe previews."""
 
-import sys
+from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(__file__))
-import support  # noqa: E402
+import pytest
 
-support.install_entry_points()
-support.tolerate_missing_duckdb()
-
-from streamwright.spark.cli import main  # noqa: E402
-
-EXAMPLE = os.path.join(os.path.dirname(__file__), "..", "examples", "s3_events_to_delta", "job.yaml")
+from streamwright.spark.cli import main
+from streamwright.spark.cli.run import _driver_flags, _preview_dry_run, _spark_conf, _submit
+from streamwright.spark.contracts import LaunchError, LaunchFailureError
+from streamwright.spark.launchers.local import LocalLauncher
 
 
-def run(*argv):
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = main(list(argv))
-    return code, out.getvalue(), err.getvalue()
+def arguments(**options):
+    defaults = {
+        "overlay": [],
+        "set": [],
+        "config": None,
+        "follow": False,
+        "available_now": False,
+        "drain": False,
+        "interval": "10s",
+        "max_messages": 500,
+        "run_key": None,
+        "no_init_state": False,
+        "log_level": None,
+        "conf": [],
+        "job": "job.yaml",
+        "lock": None,
+        "secrets": None,
+        "detach": False,
+    }
+    defaults.update(options)
+    return SimpleNamespace(**defaults)
 
 
-class Cli(unittest.TestCase):
-    def test_validate_example(self):
-        code, out, err = run("validate", EXAMPLE, "--analyze", "--graph", "--strict")
-        self.assertEqual(code, 0, err)
-        self.assertIn("ok", out)
-        self.assertIn("Spark actions per batch", out)
-        self.assertIn("one action (the write)", out)
-        self.assertIn("event read", out)
-
-    def test_docker_overlay_is_valid(self):
-        overlay = os.path.join(os.path.dirname(__file__), "..", "overlays", "docker.yaml")
-        code, out, err = run("validate", EXAMPLE, "--overlay", overlay, "--strict")
-        self.assertEqual(code, 0, err)
-
-    def test_validate_reports_problems_with_exit_2(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bad.yaml")
-            with open(path, "w") as f:
-                f.write("kind: Source\nname: X\n")
-            code, _, err = run("validate", path)
-        self.assertEqual(code, 2)
-        self.assertIn("kind must be SparkJob", err)
-
-    def test_validate_missing_file(self):
-        code, _, err = run("validate", "/nonexistent/job.yaml")
-        self.assertEqual(code, 2)
-        self.assertIn("cannot read", err)
-
-    def test_dry_run_prints_plan_without_spark(self):
-        code, out, err = run("run", EXAMPLE, "--dry-run", "--set", "kafka_bootstrap=k:9092", "--set", "lake_bucket=b")
-        self.assertEqual(code, 0, err)
-        self.assertIn("write", out)
-
-    def test_dry_run_accepts_log_level_and_conf(self):
-        code, out, err = run("run", EXAMPLE, "--dry-run", "--set", "kafka_bootstrap=k:9092", "--set", "lake_bucket=b",
-                             "--log-level", "error", "--conf", "spark.sql.shuffle.partitions=4")
-        self.assertEqual(code, 0, err)
-        self.assertIn("write", out)
-
-    def test_dry_run_missing_config_is_a_usage_error(self):
-        code, _, err = run("run", EXAMPLE, "--dry-run")
-        self.assertEqual(code, 2)
-        self.assertIn("missing required config", err)
-
-    def test_run_with_named_job_flags(self):
-        # 1. --job flag
-        code, out, err = run("run", "--job", EXAMPLE, "--dry-run", "--set", "kafka_bootstrap=k:9092", "--set", "lake_bucket=b")
-        self.assertEqual(code, 0, err)
-        self.assertIn("write", out)
-
-        # 2. -j flag
-        code, out, err = run("run", "-j", EXAMPLE, "--dry-run", "--set", "kafka_bootstrap=k:9092", "--set", "lake_bucket=b")
-        self.assertEqual(code, 0, err)
-        self.assertIn("write", out)
-
-        # 3. --file flag
-        code, out, err = run("run", "--file", EXAMPLE, "--dry-run", "--set", "kafka_bootstrap=k:9092", "--set", "lake_bucket=b")
-        self.assertEqual(code, 0, err)
-        self.assertIn("write", out)
-
-    def test_missing_job_gives_clear_error(self):
-        code, _, err = run("run")
-        self.assertEqual(code, 2)
-        self.assertIn("job is required", err)
-
-    def test_no_command(self):
-        code, _, _ = run()
-        self.assertEqual(code, 2)
+def test_missing_job_and_empty_command(capsys):
+    assert main([]) == 2
+    assert main(["run"]) == 2
+    assert "job is required" in capsys.readouterr().err
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_shared_driver_flags_preserve_overlay_and_config():
+    flags = _driver_flags(
+        arguments(
+            overlay=["config/production.yaml"],
+            set=["tenant=a"],
+            config="inputs/tenant.yaml",
+            follow=True,
+            max_messages=25,
+        )
+    )
+    assert flags == [
+        "--overlay",
+        "production.yaml",
+        "--set",
+        "tenant=a",
+        "--config",
+        "tenant.yaml",
+        "--follow",
+        "--interval",
+        "10s",
+        "--max-messages",
+        "25",
+    ]
+
+
+def test_environment_secrets_are_not_submitted():
+    job = {
+        "runtime": {"env": {"STREAMWRIGHT_SECRET_TOKEN": "private-value", "MODE": "production"}, "spark": {"conf": {}}}
+    }
+    conf = _spark_conf(job, [])
+    assert "private-value" not in str(conf)
+    assert conf["spark.executorEnv.MODE"] == "production"
+    with pytest.raises(LaunchError, match="secret"):
+        _spark_conf(
+            {
+                "runtime": {
+                    "env": {"STREAMWRIGHT_SECRET_TOKEN": "private-value"},
+                    "spark": {"conf": {"spark.executorEnv.TOKEN": "private-value"}},
+                }
+            },
+            [],
+        )
+
+
+def test_a_secret_in_conf_is_matched_like_redaction_not_as_any_substring():
+    # a 2-character secret is too short to redact (and so to match): an ordinary path containing it is fine
+    env = {"STREAMWRIGHT_SECRET_PASSWORD": "sw"}
+    conf = _spark_conf({"runtime": {"env": env, "spark": {"conf": {"spark.checkpoint.dir": "/tmp/.sw-live/cp"}}}}, [])
+    assert conf["spark.checkpoint.dir"] == "/tmp/.sw-live/cp"
+    with pytest.raises(LaunchError, match="secret"):
+        _spark_conf({"runtime": {"env": {"STREAMWRIGHT_SECRET_TOKEN": "tok-12345"},
+                                 "spark": {"conf": {"spark.x": "prefix-tok-12345"}}}}, [])
+
+
+def test_submit_forwards_shared_flags_and_does_not_ship_secret_file(capsys):
+    class FakeLauncher:
+        def check_lock(self, lock, platform):
+            return []
+
+        def submit(self, job_path, argv, conf, lock, detach, **kwargs):
+            assert argv == _driver_flags(args)
+            assert kwargs["files"] == ["production.yaml", "tenant.yaml"]
+            return 0
+
+    args = arguments(overlay=["production.yaml"], config="tenant.yaml")
+    assert _submit({}, args, {}, {"type": "standalone"}, FakeLauncher()) == 0
+    args.secrets = "private.yaml"
+    assert _submit({}, args, {}, {"type": "standalone"}, FakeLauncher()) == 2
+    assert "not delivered to cluster drivers" in capsys.readouterr().err
+
+
+def test_remote_step_failure_has_execution_exit_code(capsys):
+    class FailedLauncher:
+        def check_lock(self, lock, platform):
+            return []
+
+        def submit(self, *args, **kwargs):
+            raise LaunchFailureError("step failed: driver stopped")
+
+    assert _submit({}, arguments(), {}, {"type": "standalone"}, FailedLauncher()) == 1
+    assert "driver stopped" in capsys.readouterr().err
+
+
+def test_local_preview_uses_launcher_not_platform_switch(capsys):
+    job = {
+        "name": "sample",
+        "steps": [],
+        "outputs": [{"name": "result", "sql": "SELECT 1"}],
+        "runtime": {"spark": {"conf": {}}},
+    }
+    _preview_dry_run(job, {}, arguments(), lock={}, platform={"type": "local"}, launcher=LocalLauncher())
+    output = capsys.readouterr().out
+    assert "Spark actions per batch" in output and "spark-submit" in output

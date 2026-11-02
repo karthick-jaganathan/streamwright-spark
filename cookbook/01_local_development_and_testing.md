@@ -58,12 +58,12 @@ docker compose ps
 To automatically create Kafka topics, create S3 buckets (`acme-landing`, `acme-lake`, `code-bucket`), upload sample CSV order files, and emit arrival events to Kafka:
 
 ```bash
-make seed
+make seed-order-files
 ```
 
 *Equivalent command:*
 ```bash
-sh docker/seed.sh
+sh docker/seed_order_files.sh
 ```
 
 ---
@@ -84,8 +84,8 @@ sh docker/publish_s3.sh
 This ensures `s3://code-bucket/` contains:
 - `s3://code-bucket/packages/*.whl`: Pure Python wheels for core, spark, connectors, and `delta-spark`.
 - `s3://code-bucket/entrypoint.py`: Driver bootstrap entrypoint.
-- `s3://code-bucket/jobs/s3_events_to_delta/job.yaml`: Job specification.
-- `s3://code-bucket/jobs/s3_events_to_delta/overlay.yaml`: Docker runtime overlay.
+- `s3://code-bucket/jobs/kafka/order_files.yaml`: Job specification.
+- `s3://code-bucket/jobs/kafka/order_files.docker.yaml`: Docker runtime overlay.
 
 ---
 
@@ -97,12 +97,12 @@ You can run the pipeline using either of two methods:
 Runs inside `spark-clean:latest` (a bare Spark container with **zero** StreamWright packages pre-installed). Spark pulls all code and configuration dynamically from S3:
 
 ```bash
-make submit-blind
+make submit-order-files
 ```
 
 *Equivalent command:*
 ```bash
-sh docker/submit_blind.sh
+sh docker/submit_order_files.sh
 ```
 
 ### Method B: Direct Host CLI Run (From macOS Terminal)
@@ -112,14 +112,12 @@ Runs in-process using your local Python virtual environment, connecting to Local
 AWS_ACCESS_KEY_ID=test \
 AWS_SECRET_ACCESS_KEY=test \
 AWS_DEFAULT_REGION=us-east-1 \
-STREAMWRIGHT_SECRET_AWS_ACCESS_KEY_ID=test \
-STREAMWRIGHT_SECRET_AWS_SECRET_ACCESS_KEY=test \
-STREAMWRIGHT_SECRET_S3_KEY_ID=test \
-STREAMWRIGHT_SECRET_S3_SECRET=test \
+AWS_ACCESS_KEY_ID=test \
+AWS_SECRET_ACCESS_KEY=test \
 STREAMWRIGHT_SECRET_OPS_DB_PASSWORD=change-me-locally \
 STREAMWRIGHT_SECRET_REPORTING_DB_PASSWORD=change-me-locally \
-sw spark run examples/s3_events_to_delta \
-  --overlay overlays/local.yaml \
+sw spark run examples/kafka/order_files.yaml \
+  --overlay examples/kafka/order_files.local.yaml \
   --set kafka_bootstrap=127.0.0.1:9094 \
   --set lake_bucket=acme-lake \
   --once

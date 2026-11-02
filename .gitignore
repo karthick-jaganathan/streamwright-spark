@@ -4,6 +4,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+spark-warehouse/
 *.lock.json.tmp
 # secrets never live in this repo (read STREAMWRIGHT_SECRET_* or --secrets FILE at run time)
 secrets*.yaml

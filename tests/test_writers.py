@@ -1,175 +1,269 @@
-import unittest
+"""The Spark io helpers of the database and table families: JDBC targets and SQL, Delta writes and registration."""
 
-from streamwright.spark.kinds import merge_condition
-from streamwright.spark.kinds import identifier
-from streamwright.connectors.postgres._spark import upsert_sql
+from types import SimpleNamespace
 
+import pytest
 
-class Pure(unittest.TestCase):
-    def test_identifier(self):
-        self.assertEqual(identifier("reporting.ingest_audit"), '"reporting"."ingest_audit"')
-        for bad in ("a;b", "a.b.c", "a b", 'a"b', "", "1abc", "a--b"):
-            with self.assertRaises(ValueError, msg=bad):
-                identifier(bad)
+from streamwright.core.jobs import BatchContext
+from streamwright.core.sdk.contract import ConnectorDefinition, Field, check_arguments
+from streamwright.core.sdk.operations import databases, tables
+from streamwright.spark.engine.runtime import StepRuntime
+from streamwright.spark.io import delta, jdbc
+from streamwright.spark.io.capabilities import CAPABILITIES
+from streamwright.spark.io.sql import quote_identifier
+from streamwright.spark.job.rules import SparkRules
+from streamwright.spark.runtime.definition import DefinedAdapter
+from streamwright.spark.sdk import SparkContext
 
-    def test_merge_condition(self):
-        self.assertEqual(merge_condition("target.id = source.id", None), "target.id = source.id")
-        self.assertEqual(merge_condition("target.id = source.id", "target.d IN (DATE '2026-10-17')"),
-                         "(target.d IN (DATE '2026-10-17')) AND (target.id = source.id)")
-
-    def test_upsert_sql(self):
-        sql = upsert_sql("reporting.ingest_audit", "reporting.ingest_audit_stg", ["batch_id", "client_id"],
-                         ["row_count", "revenue"])
-        self.assertEqual(sql, 'INSERT INTO "reporting"."ingest_audit" ("batch_id", "client_id", "row_count", "revenue") '
-                              'SELECT "batch_id", "client_id", "row_count", "revenue" FROM "reporting"."ingest_audit_stg" '
-                              'ON CONFLICT ("batch_id", "client_id") DO UPDATE SET "row_count" = EXCLUDED."row_count", '
-                              '"revenue" = EXCLUDED."revenue"')
-        self.assertTrue(upsert_sql("t", "s", ["k"], None).endswith("DO NOTHING"))
-
-    def test_upsert_rejects_injection(self):
-        with self.assertRaises(ValueError):
-            upsert_sql("t", "s", ["k; DROP TABLE x"], ["v"])
-
-
-class DeltaRegistration(unittest.TestCase):
-    def setUp(self):
-        from streamwright.spark.kinds.delta import Delta
-        self.delta = Delta()
-
-    def test_ensure_registered_ddl_and_caching(self):
-        class MockSpark:
-            def __init__(self):
-                self.executed = []
-
-            def sql(self, statement):
-                self.executed.append(statement)
-
-        class MockAdapter:
-            def roots(self, auth):
-                return ["s3://lake/"]
-
-            def to_hadoop(self, path, auth):
-                return path.replace("s3://", "s3a://")
-
-        class MockStorage:
-            auth = {}
-
-        class MockConnection:
-            auth = {
-                "storage": "lake",
-                "schema": "analytics",
-                "schema_location": "s3://lake/analytics/",
-                "schema_comment": "Enterprise analytics schema",
-            }
-
-        class MockRuntime:
-            def __init__(self):
-                self.spark = MockSpark()
-                self._registered_tables = set()
-
-            def text(self, val):
-                return val
-
-            def storage_of(self, conn):
-                return MockAdapter(), MockStorage()
-
-        rt = MockRuntime()
-        conn = MockConnection()
-        args = {
-            "table_path": "s3://lake/delta/orders",
-            "table_name": "orders",
-            "table_properties": {"delta.autoOptimize.optimizeWrite": True},
-            "comment": "Orders table",
-        }
-
-        # First run: should execute CREATE SCHEMA, CREATE TABLE, and ALTER TABLE SET TBLPROPERTIES
-        self.delta._ensure_registered(rt, conn, args, None, "s3a://lake/delta/orders")
-        self.assertEqual(len(rt.spark.executed), 3)
-        self.assertIn("CREATE SCHEMA IF NOT EXISTS `analytics` COMMENT 'Enterprise analytics schema' LOCATION 's3a://lake/analytics/'", rt.spark.executed[0])
-        self.assertIn("CREATE TABLE IF NOT EXISTS `analytics`.`orders` USING DELTA LOCATION 's3a://lake/delta/orders'", rt.spark.executed[1])
-        self.assertIn("ALTER TABLE `analytics`.`orders` SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true', 'comment' = 'Orders table')", rt.spark.executed[2])
-        self.assertIn(("analytics", "orders"), rt._registered_tables)
-
-        # Second run: should be cached in memory (0 SQL statements executed, 0ms overhead)
-        self.delta._ensure_registered(rt, conn, args, None, "s3a://lake/delta/orders")
-        self.assertEqual(len(rt.spark.executed), 3)
-
-    def test_ensure_registered_derives_table_name_from_path(self):
-        class MockSpark:
-            def __init__(self):
-                self.executed = []
-
-            def sql(self, statement):
-                self.executed.append(statement)
-
-        class MockRuntime:
-            def __init__(self):
-                self.spark = MockSpark()
-                self._registered_tables = set()
-
-            def text(self, val):
-                return val
-
-            def storage_of(self, conn):
-                return None, None
-
-        rt = MockRuntime()
-        conn = type("C", (), {"auth": {"schema": "analytics"}})()
-        args = {"table_path": "s3://lake/delta/orders"}
-
-        self.delta._ensure_registered(rt, conn, args, None, "s3a://lake/delta/orders")
-        self.assertIn("CREATE TABLE IF NOT EXISTS `analytics`.`orders` USING DELTA LOCATION 's3a://lake/delta/orders'", rt.spark.executed[1])
-        self.assertIn(("analytics", "orders"), rt._registered_tables)
-
-    def test_ensure_registered_rejects_sql_injection_in_identifiers(self):
-        class MockRuntime:
-            def __init__(self):
-                self.spark = None
-
-        rt = MockRuntime()
-        conn = type("C", (), {"auth": {}})()
-
-        for bad in ("bad;schema", "bad schema", "bad-schema", "bad'schema"):
-            with self.assertRaises(ValueError):
-                self.delta._ensure_registered(rt, conn, {"schema": bad, "table_name": "orders"}, None, "s3a://lake/orders")
-
-    def test_matched_clauses(self):
-        class MockBuilder:
-            def __init__(self):
-                self.calls = []
-
-            def whenMatchedUpdate(self, condition=None, set=None):
-                self.calls.append(("update", condition, set))
-                return self
-
-            def whenMatchedUpdateAll(self, condition=None):
-                self.calls.append(("update_all", condition))
-                return self
-
-            def whenMatchedDelete(self, condition=None):
-                self.calls.append(("delete", condition))
-                return self
-
-        # 1. whenMatchedUpdate with explicit set mapping
-        b = MockBuilder()
-        self.delta._matched(b, {"action": "update", "set": {"amount": "source.amount", "tax": "source.tax"}})
-        self.assertEqual(b.calls, [("update", None, {"amount": "source.amount", "tax": "source.tax"})])
-
-        # 2. whenMatchedUpdate with condition and set
-        b = MockBuilder()
-        self.delta._matched(b, {"action": "update", "condition": "source.amount > 0", "set": {"amount": "source.amount"}})
-        self.assertEqual(b.calls, [("update", "source.amount > 0", {"amount": "source.amount"})])
-
-        # 3. whenMatchedUpdateAll (no set)
-        b = MockBuilder()
-        self.delta._matched(b, {"action": "update"})
-        self.assertEqual(b.calls, [("update_all", None)])
-
-        # 4. whenMatchedDelete
-        b = MockBuilder()
-        self.delta._matched(b, {"action": "delete", "condition": "source.amount <= 0"})
-        self.assertEqual(b.calls, [("delete", "source.amount <= 0")])
+DIALECT = jdbc.JdbcDialect(
+    name="database",
+    url_template="jdbc:database://{host}:{port}/{database}",
+    driver="org.Driver",
+    default_port=5432,
+    staging_statement=lambda target, staging: "CREATE TABLE %s (LIKE %s)" % (staging, target),
+    merge_statement=lambda target, staging, columns, key, update: "MERGE %s %s %s" % (target, staging, update),
+    delete_statement=lambda target, staging, key: "DELETE %s %s %s" % (target, staging, key),
+)
+DEFINITION = ConnectorDefinition(
+    "database",
+    "Database",
+    "databases",
+    connection=(Field("host", "string"),),
+    operations=(databases.QUERY, databases.WRITE, tables.WRITE),
+    adapters={"spark": "x:Y"},
+)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_jdbc_urls_refuse_driver_properties_in_host_database_or_port():
+    values = {"host": "db.example", "database": "orders", "user": "u", "password": "p"}
+    for field, value in (
+        ("database", "orders?socketFactory=evil"),
+        ("database", "orders;ssl=false"),
+        ("database", "orders/path"),
+        ("host", "host:5432/evil"),
+        ("host", "999.999.999.999"),
+        ("port", "5432?ssl=false"),
+        ("port", 70000),
+    ):
+        with pytest.raises(ValueError):
+            jdbc.jdbc_target(DIALECT, **dict(values, **{field: value}))
+    target = jdbc.jdbc_target(DIALECT, **dict(values, host="[::1]"))
+    assert target.url == "jdbc:database://[::1]:5432/orders" and target.properties["password"] == "p"
+    assert "'p'" not in repr(target)
+    assert target.with_options({"fetchsize": 10})["fetchsize"] == "10"
+
+
+def test_jdbc_driver_options_forward_undeclared_operation_arguments_to_the_properties():
+    """A `database.query` vendor argument (fetchsize, sessionInitStatement, ...) reaches the JDBC properties."""
+    operation = DEFINITION.operation("database", "query")
+    options = jdbc.driver_options(operation, {"query": "SELECT 1", "fetchsize": 500,
+                                              "sessionInitStatement": "SET work_mem='64MB'"})
+    assert options == {"fetchsize": 500, "sessionInitStatement": "SET work_mem='64MB'"}
+    properties = jdbc.JdbcTarget("jdbc:database://h:5432/d", {"user": "u"}).with_options(options)
+    assert properties["fetchsize"] == "500" and properties["sessionInitStatement"] == "SET work_mem='64MB'"
+
+
+def test_delta_vendor_options_forward_reader_options_and_reject_adapter_owned_ones():
+    """A `table.read` vendor option (readChangeFeed, ...) reaches `.option()`; owned keys are rejected."""
+    operation = tables.READ
+    options = delta._vendor_options(operation, {"readChangeFeed": "true", "startingVersion": 3}, delta._READ_OWNED)
+    assert options == {"readChangeFeed": "true", "startingVersion": 3}
+    with pytest.raises(ValueError, match="versionAsOf set by the adapter"):
+        delta._vendor_options(operation, {"versionAsOf": 2}, delta._READ_OWNED)
+
+
+def test_identifiers_are_validated_not_escaped():
+    assert quote_identifier("reporting.ingest_audit") == '"reporting"."ingest_audit"'
+    for bad in ("a;b", "a.b.c", "a b", 'a"b', "", "1abc", "a--b"):
+        with pytest.raises(ValueError):
+            quote_identifier(bad)
+
+
+def test_query_parameters_are_literals_and_table_reads_use_the_default_schema():
+    assert jdbc.bind_params("SELECT * FROM t WHERE a = $a AND s = '$a' -- $b", {"a": "x'y"}) == (
+        "SELECT * FROM t WHERE a = 'x''y' AND s = '$a' -- $b"
+    )
+    for params in ({}, {"a": 1, "unused": 2}):
+        with pytest.raises(ValueError):
+            jdbc.bind_params("SELECT $a", params)
+    assert (
+        jdbc.table_sql(
+            DIALECT, {"table": "orders", "columns": ["id"], "where": [{"column": "id", "op": "IN", "value": [1, 2]}]}
+        )
+        == 'SELECT "id" FROM "public"."orders" WHERE "id" IN (1, 2)'
+    )
+
+
+class _Writer:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def option(self, *args):
+        self.calls.append(("option", args))
+        return self
+
+    def jdbc(self, url, table, mode, properties):
+        self.calls.append(("jdbc", table, mode))
+
+
+class _Frame:
+    columns = ("id", "v")
+
+    def __init__(self, calls):
+        self.write = _Writer(calls)
+
+    def observe(self, *args):
+        return self
+
+
+class _Connection:
+    def __init__(self, calls, fail=None):
+        self.calls, self.fail = calls, fail
+
+    def cursor(self):
+        return self
+
+    def execute(self, statement):
+        self.calls.append(("sql", statement))
+        if self.fail and statement.startswith(self.fail):
+            raise RuntimeError("boom")
+
+    def commit(self):
+        self.calls.append(("commit",))
+
+    def rollback(self):
+        self.calls.append(("rollback",))
+
+    def close(self):
+        pass
+
+
+def _context(store_identity="store-id"):
+    runtime = StepRuntime(None, BatchContext("b-1", 7, "2026-10-05T00:00:00Z", "job", 1, store_identity, {}),
+                          {}, {}, {}, limits={})
+    return SparkContext(runtime, "out", {})
+
+
+def test_a_staged_merge_loads_a_temporary_table_and_drops_it_even_when_the_merge_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(jdbc, "_receipt", lambda name, table, metrics: (name, table))
+    monkeypatch.setattr(jdbc, "_observed", lambda frame, name: (frame, None))
+    target = jdbc.jdbc_target(DIALECT, host="db", database="d", user="u", password="p")
+    arguments = {"table": "s.t", "mode": "merge", "primary_key": ["id"]}
+    jdbc.write_table(
+        _context(), _Frame(calls), arguments, dialect=DIALECT, target=target, connect=lambda: _Connection(calls)
+    )
+    staging = calls[0][1].split()[2]
+    assert staging.startswith('"s"."_sw_stg_out_7_') and calls[1] == ("commit",)
+    assert calls[2] == ("jdbc", staging.replace('"', ""), "append")
+    assert calls[3] == ("sql", 'MERGE "s"."t" %s [\'"v"\']' % staging) and calls[4] == ("sql", "DROP TABLE " + staging)
+    calls.clear()
+    with pytest.raises(RuntimeError):
+        jdbc.write_table(
+            _context(),
+            _Frame(calls),
+            dict(arguments, mode="delete"),
+            dialect=DIALECT,
+            target=target,
+            connect=lambda: _Connection(calls, fail="DELETE"),
+        )
+    assert ("rollback",) in calls and calls[-2][1].startswith("DROP TABLE IF EXISTS")
+
+
+def test_a_named_staging_table_is_truncated_and_renders_its_tokens(monkeypatch):
+    calls = []
+    monkeypatch.setattr(jdbc, "_receipt", lambda name, table, metrics: (name, table))
+    monkeypatch.setattr(jdbc, "_observed", lambda frame, name: (frame, None))
+    target = jdbc.jdbc_target(DIALECT, host="db", database="d", user="u", password="p")
+    jdbc.write_table(
+        _context(),
+        _Frame(calls),
+        {
+            "table": "t",
+            "mode": "delete",
+            "primary_key": ["id"],
+            "staging_table": "s.stg_{{ output.name }}_{{ batch.seq }}",
+        },
+        dialect=DIALECT,
+        target=target,
+        connect=lambda: _Connection(calls),
+    )
+    assert calls[0] == ("option", ("truncate", "true")) and calls[1] == ("jdbc", "s.stg_out_7", "overwrite")
+    assert calls[-2] == ("sql", 'TRUNCATE TABLE "s"."stg_out_7"')
+
+
+def test_a_replayed_delta_append_returns_its_own_commit_without_writing(monkeypatch):
+    monkeypatch.setattr(delta, "_find_commit", lambda *args: (17, {"numOutputRows": "9"}))
+    monkeypatch.setattr(delta, "_writer", lambda *args: pytest.fail("a replay must not write"))
+    monkeypatch.setattr(delta, "_register", lambda *args: None)
+    receipt = delta.write_table(_context(), None, {}, path="file:///table", defaults={})
+    assert (receipt.output_name, receipt.destination, receipt.version, receipt.rows) == ("out", "file:///table", 17, 9)
+
+
+def test_a_delta_append_transaction_key_includes_the_store_identity(monkeypatch):
+    captured = {}
+
+    def find_commit(context, path, app_id, transaction):
+        captured["app_id"], captured["transaction"] = app_id, transaction
+        return (3, {"numOutputRows": "5"})           # pretend already committed so no real write happens
+
+    monkeypatch.setattr(delta, "_find_commit", find_commit)
+    monkeypatch.setattr(delta, "_register", lambda *args: None)
+    delta.write_table(_context("store-xyz"), None, {}, path="file:///table", defaults={})
+    assert captured == {"app_id": "job:out:store-xyz", "transaction": 7}
+
+
+def test_registration_creates_what_the_catalog_lacks_with_validated_names():
+    executed = []
+    spark = SimpleNamespace(sql=executed.append, catalog=SimpleNamespace(tableExists=lambda name: False))
+    context = SimpleNamespace(spark=spark)
+    delta._register(context, {"table_properties": {"k": "it's"}}, {"schema": "analytics"}, "s3a://lake/orders", None)
+    assert executed == [
+        "CREATE SCHEMA IF NOT EXISTS `analytics`",
+        "CREATE TABLE IF NOT EXISTS `analytics`.`orders` USING DELTA LOCATION 's3a://lake/orders'",
+        "ALTER TABLE `analytics`.`orders` SET TBLPROPERTIES ('k' = 'it''s')",
+    ]
+    for bad in ("bad;schema", "bad schema", "bad'schema"):
+        with pytest.raises(ValueError):
+            delta._register(context, {"schema": bad, "table_name": "orders"}, {}, "s3a://lake/orders", None)
+
+
+def test_merge_clauses_use_the_shared_predicate_key():
+    calls = []
+    builder = SimpleNamespace(
+        whenMatchedUpdate=lambda condition, set: calls.append(("update", condition, set)) or builder,
+        whenMatchedDelete=lambda condition: calls.append(("delete", condition)) or builder,
+        whenNotMatchedInsertAll=lambda condition: calls.append(("insert", condition)) or builder,
+    )
+    delta._with_clauses(
+        builder,
+        {
+            "when_matched": [
+                {"action": "update", "predicate": "source.n > 0", "set": {"n": "source.n"}},
+                {"action": "delete"},
+            ],
+            "when_not_matched": [{"action": "insert"}],
+        },
+    )
+    assert calls == [("update", "source.n > 0", {"n": "source.n"}), ("delete", None), ("insert", None)]
+
+
+def test_spark_rules_judge_replay_safety_and_merge_scope_of_defined_writes():
+    rules = SparkRules({"database": DefinedAdapter(DEFINITION, SimpleNamespace(state_connection=print))})
+    connection = {"provider": "database"}
+
+    def check(service, method, arguments):
+        return [
+            (code, warning)
+            for code, _, warning in rules._check_call(
+                {"name": "o", "service": service, "method": method, "arguments": arguments}, connection, False
+            )
+        ]
+
+    assert check("database", "write", {"table": "t"}) == [("not-idempotent", True)]
+    assert check("database", "write", {"table": "t", "mode": "merge", "primary_key": ["id"]}) == []
+    assert check(
+        "table", "write", {"path": "t", "mode": "merge", "condition": "c", "when_not_matched": [{"action": "insert"}]}
+    ) == [("merge-scope", True)]
+    assert rules.adapters["database"].holds_state
+    assert check_arguments(DEFINITION, databases.WRITE, {"table": "t", "mode": "overwrite"}, CAPABILITIES)
