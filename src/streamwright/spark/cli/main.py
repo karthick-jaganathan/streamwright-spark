@@ -30,10 +30,11 @@ _COMMANDS = (
 
 
 def _parser():
-    parser = argparse.ArgumentParser(prog="sw spark", description="Spark jobs for StreamWright.")
+    # no prefix matching: an unknown --log must not be taken for --log-level (Spark's level)
+    parser = argparse.ArgumentParser(prog="sw spark", description="Spark jobs for StreamWright.", allow_abbrev=False)
     sub = parser.add_subparsers(dest="command")
     for name, module, help_text, many in _COMMANDS:
-        command = sub.add_parser(name, help=help_text)
+        command = sub.add_parser(name, help=help_text, allow_abbrev=False)
         if many is not None:
             add_job_arguments(command, many)
         module.add_arguments(command)

@@ -39,6 +39,13 @@ def test_missing_job_and_empty_command(capsys):
     assert "job is required" in capsys.readouterr().err
 
 
+def test_options_are_not_abbreviated(capsys):
+    # --log is not --log-level (Spark's level) cut short
+    with pytest.raises(SystemExit) as usage:
+        main(["run", "job.yaml", "--log", "WARN"])
+    assert usage.value.code == 2 and "unrecognized arguments: --log WARN" in capsys.readouterr().err
+
+
 def test_shared_driver_flags_preserve_overlay_and_config():
     flags = _driver_flags(
         arguments(
