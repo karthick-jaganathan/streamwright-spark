@@ -9,6 +9,6 @@ __all__ = ["main", "register"]
 
 def register(subparsers):
     parser = subparsers.add_parser("spark", help="validate, run and inspect SparkJob pipelines", add_help=False)
-    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true", help="show the sw spark help")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     parser.set_defaults(command_handler=lambda args: main(["--help"] if args.help else args.arguments))

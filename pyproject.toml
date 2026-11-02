@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "streamwright-spark"
-version = "0.1.1"
+version = "0.1.2"
 description = "Spark jobs for StreamWright (kind: SparkJob), attached as `sw spark ...`."
 readme = "README.md"
 license = "Apache-2.0"
