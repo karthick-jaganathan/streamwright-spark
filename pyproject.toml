@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "streamwright-spark"
-version = "0.1.3"
+version = "0.1.4"
 description = "Spark jobs for StreamWright (kind: SparkJob), attached as `sw spark ...`."
 readme = "README.md"
 license = "Apache-2.0"
@@ -25,7 +25,7 @@ requires-python = ">=3.11"
 # Validation, planning, naming, the state store and the batch loop need only the standard library, PyYAML and
 # streamwright (core), so `sw spark validate` runs without Spark. The connectors themselves come from the hub:
 # `streamwright connectors install s3 postgres deltalake kafka sqs ...`. Everything else is an extra.
-dependencies = ["pyyaml==6.0.2", "streamwright~=0.1.14"]
+dependencies = ["pyyaml==6.0.2", "streamwright~=0.1.15"]
 
 [project.urls]
 Homepage = "https://streamwright.web.app"

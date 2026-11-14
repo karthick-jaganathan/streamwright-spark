@@ -21,7 +21,7 @@ import re
 from types import MappingProxyType
 
 from streamwright.core.jobs import JobRules
-from streamwright.core.jobs.calls import partition_problems
+from streamwright.core.jobs.calls import call_problems, connection_problems, partition_problems
 from streamwright.core.jobs.check.rules import NAME_PATTERN, input_field, install_hint
 from streamwright.core.jobs.fields import Field
 from streamwright.core.jobs.locking import STATE_FIELDS
@@ -250,6 +250,8 @@ class SparkRules(JobRules):
                                  False))
             elif "request" not in step and "service" not in step and "method" not in step:
                 problems.append(("missing-key", "a call step needs `service`/`method` or a `request`", False))
+            elif provider in self.connectors:
+                problems += call_problems(step, connections[step["connection"]])
             problems += partition_problems(step)
         if step.get("persist") is not None:
             value = str(step["persist"]).strip()
@@ -261,7 +263,7 @@ class SparkRules(JobRules):
         adapter = self.adapters.get(connection.get("provider"))
         if adapter is None:
             if connection.get("provider") in self.connectors:
-                return []                                  # a call-step source connector; the source engine checks it
+                return connection_problems(connection)     # a call step's source connector
             return [("no-adapter", "provider %r has neither a Spark adapter nor an installed connector: %s"
                      % (connection.get("provider"), install_hint(connection.get("provider"))), False)]
         auth = {key: value for key, value in connection.items() if key != "provider"}
