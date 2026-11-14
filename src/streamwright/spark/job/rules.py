@@ -22,7 +22,7 @@ from types import MappingProxyType
 
 from streamwright.core.jobs import JobRules
 from streamwright.core.jobs.calls import partition_problems
-from streamwright.core.jobs.check.rules import NAME_PATTERN, input_field
+from streamwright.core.jobs.check.rules import NAME_PATTERN, input_field, install_hint
 from streamwright.core.jobs.fields import Field
 from streamwright.core.jobs.locking import STATE_FIELDS
 from streamwright.core.jobs.log_labels import LOG_FIELD
@@ -243,8 +243,8 @@ class SparkRules(JobRules):
             provider = connections[step["connection"]]["provider"]
             if provider not in self.connectors:
                 problems.append(("connector-not-installed",
-                                 "provider %r has neither a Spark adapter nor an installed connector for calls"
-                                 % provider, False))
+                                 "provider %r has neither a Spark adapter nor an installed connector for calls: %s"
+                                 % (provider, install_hint(provider)), False))
             if "request" in step and ("service" in step or "method" in step):
                 problems.append(("bad-value", "a call is `request` (HTTP) or `service`/`method` (SDK), not both",
                                  False))
@@ -262,9 +262,8 @@ class SparkRules(JobRules):
         if adapter is None:
             if connection.get("provider") in self.connectors:
                 return []                                  # a call-step source connector; the source engine checks it
-            return [("no-adapter", "provider %r has neither a Spark adapter nor an installed connector "
-                     "(pip install streamwright-%s)" % (connection.get("provider"), connection.get("provider")),
-                     False)]
+            return [("no-adapter", "provider %r has neither a Spark adapter nor an installed connector: %s"
+                     % (connection.get("provider"), install_hint(connection.get("provider"))), False)]
         auth = {key: value for key, value in connection.items() if key != "provider"}
         return [
             ("bad-connection", _contract_issue(issue), False) for issue in check_connection(adapter.definition, auth)
