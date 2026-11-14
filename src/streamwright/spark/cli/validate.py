@@ -1,21 +1,47 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """sw spark validate: check jobs without Spark, brokers or credentials."""
 
 import contextlib
+import dataclasses
 
+from streamwright.core.cli.jobs import JOB_HELP
 from streamwright.core.jobs.inputs import InputError, parse_set, read_config_values
 from streamwright.spark.cli.common import err
 from streamwright.spark.job import validate as validate_job
 from streamwright.spark.plan import build_plan
 from streamwright.spark.runtime.registry import Registry, RegistryError
 
-__all__ = ["add_arguments", "run"]
+__all__ = ["add_arguments", "add_plan_arguments", "run"]
+
+
+def add_plan_arguments(parser):
+    """`plan`: validate with the plan printed (--analyze and --graph are always on)."""
+    parser.add_argument("--strict", action="store_true", help=JOB_HELP["strict"])
+    parser.add_argument("--lock", metavar="FILE",
+                        help="the dependency lock file (sw spark lock) to check the installed versions against")
 
 
 def add_arguments(parser):
-    parser.add_argument("--analyze", action="store_true", help="print the Spark actions and recomputation warnings")
-    parser.add_argument("--graph", action="store_true", help="print step dependencies")
-    parser.add_argument("--strict", action="store_true", help="warnings fail the check")
-    parser.add_argument("--lock", help="path to a lock file to verify compatibility against")
+    parser.add_argument("--analyze", action="store_true",
+                        help="also print the Spark actions and recomputation warnings of a valid job")
+    parser.add_argument("--graph", action="store_true", help="also print each step's and output's dependencies")
+    add_plan_arguments(parser)
 
 
 def run(args):
@@ -49,7 +75,7 @@ def run(args):
                 for node in plan.nodes:
                     print("%-8s %-22s <- %s" % (node.kind, node.name, ", ".join(node.uses) or "-"))
         for issue in report.issues:
-            err("%s: %s: %s" % (path, issue.severity, issue.message))
+            err(str(issue if issue.file else dataclasses.replace(issue, file=path)))
         if report.valid and args.analyze:
             for warning in build_plan(job, adapters).warnings:
                 err("%s: warning: %s" % (path, warning))

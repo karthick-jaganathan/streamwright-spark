@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """
 The version lock: one file that pins everything the job runs with.
 
@@ -37,14 +54,24 @@ def build_lock(
     spark,
     *,
     extra_jars=None,
+    driver_packages=(),
     emr_release=None,
     python_env=None,
     image=None,
     installed=_installed,
 ):
-    """Pins what the job runs with. Each adapter reports its own packages and jars: there is no table in core."""
+    """
+    Pins what the job runs with. Each adapter reports its own packages and jars: there is no table in core.
+    `driver_packages`: the distributions of the connectors the driver runs as call steps (no Spark adapter).
+    """
     minor = ".".join(spark.split(".")[:2])
     packages, jars, missing = {"streamwright-spark": installed("streamwright-spark") or "0.0.0"}, [], []
+    for package in driver_packages:
+        version = installed(package)
+        if version is None:
+            missing.append("%s (pip install %s)" % (package, package))
+        else:
+            packages[package] = version
     for adapter in adapters_used:
         for package in adapter.packages:
             version = installed(package)
@@ -104,6 +131,20 @@ def check_lock(lock, spark_version, python=None, installed=_installed, emr_relea
     wanted = (lock.get("emr") or {}).get("release_label")
     if wanted and emr_release and emr_release != wanted:
         problems.append("cluster release is %s, the lock says %s" % (emr_release, wanted))
+    return problems
+
+
+def lock_drift(lock, current):
+    """How a lock differs from the lock the job would get now (`current`): packages and jars added or dropped."""
+    problems = []
+    pinned, wanted = set(lock.get("packages") or {}), set(current.get("packages") or {})
+    problems += ["the job now needs %s, which the lock does not pin" % name for name in sorted(wanted - pinned)]
+    problems += ["the lock pins %s, which the job no longer needs" % name for name in sorted(pinned - wanted)]
+    locked = {jar["coordinates"] for jar in lock.get("jars") or ()}
+    for jar in sorted({jar["coordinates"] for jar in current.get("jars") or ()} - locked):
+        problems.append("the job now needs jar %s, which the lock does not pin" % jar)
+    problems += ["the lock pins jar %s, which the job no longer needs" % jar
+                 for jar in sorted(locked - {jar["coordinates"] for jar in current.get("jars") or ()})]
     return problems
 
 

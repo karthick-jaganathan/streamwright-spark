@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """Driver-side Spark batches: declarative operations dispatch directly.
 
 The CLI loads this module only when executing a job. Steps build lazy DataFrames; outputs each trigger one write.
@@ -14,6 +31,7 @@ from pyspark.storagelevel import StorageLevel
 from streamwright.core.jobs import ExecutionResult, WriteReceipt, calls
 from streamwright.core.jobs.policy import SKIPPED, ExecutionPolicy, classify_transient, guard
 from streamwright.core.jobs.refs import step_columns_used, walk_strings
+from streamwright.core.runtime.logs.context import log_context
 from streamwright.spark.engine.runtime import StepRuntime
 from streamwright.spark.engine.session import resolve_driver_host
 from streamwright.spark.plan import build_plan, role_of
@@ -113,9 +131,10 @@ class SparkExecutor:
         steps = {step["name"]: step for step in self.job.get("steps") or []}
         for step in (steps[name] for name in self.plan.order):  # dependency order, as DuckDBJob runs them
             policy = ExecutionPolicy.of(step)
-            outcome = guard(policy, lambda step=step, rt=runtime: self._step(rt, step),
-                            classify=classify_transient(policy), on_retry=_retrying("step", step["name"]),
-                            on_tolerated=_tolerated("step", step["name"]))
+            with log_context(step=step["name"]):
+                outcome = guard(policy, lambda step=step, rt=runtime: self._step(rt, step),
+                                classify=classify_transient(policy), on_retry=_retrying("step", step["name"]),
+                                on_tolerated=_tolerated("step", step["name"]))
             frame = self._empty_frame() if outcome is SKIPPED else outcome
             if step.get("persist"):
                 frame = frame.persist(_resolve_storage_level(step["persist"]))
@@ -153,9 +172,10 @@ class SparkExecutor:
                 return self._write(rt, output)
 
             policy = ExecutionPolicy.of(output)
-            receipt = guard(policy, write, classify=classify_transient(policy),
-                            on_retry=_retrying("output", output["name"]),
-                            on_tolerated=_tolerated("output", output["name"]))
+            with log_context(output=output["name"]):
+                receipt = guard(policy, write, classify=classify_transient(policy),
+                                on_retry=_retrying("output", output["name"]),
+                                on_tolerated=_tolerated("output", output["name"]))
             if receipt is SKIPPED:
                 receipt = WriteReceipt(output["name"], "skipped (on_error: %s)" % policy.on_error, 0)
             hooks.record_receipt(receipt, manifest)

@@ -1,7 +1,25 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """Pieces shared by the sw spark commands."""
 
 import sys
 
+from streamwright.core.cli.jobs import JOB_HELP
 from streamwright.core.jobs.inputs import InputError as InputsError
 from streamwright.core.jobs.inputs import parse_set
 from streamwright.core.sdk.contract import resolve_connection
@@ -15,36 +33,27 @@ def err(text):
     sys.stderr.write(text + "\n")
 
 
-def add_job_arguments(parser, many=False):
+def add_job_arguments(parser, many=False, inputs=True):
+    """The job path options (--file and --pipeline are aliases of --job); `inputs`: also --config, --set."""
     if many:
-        parser.add_argument("job", nargs="*", metavar="PATH", help="path to the job definition YAML file(s)")
-        parser.add_argument(
-            "--job",
-            "-j",
-            action="append",
-            default=[],
-            dest="flag_jobs",
-            help="path to the job definition YAML file (can be specified multiple times)",
-        )
-        parser.add_argument("--file", "-f", action="append", default=[], dest="flag_files", help="alias for --job")
-        parser.add_argument("--pipeline", action="append", default=[], dest="flag_pipelines", help="alias for --job")
+        parser.add_argument("job", nargs="*", metavar="JOB", help="job manifests: YAML files, or their folders")
+        parser.add_argument("--job", "-j", action="append", default=[], dest="flag_jobs", metavar="JOB",
+                            help="a job manifest, as an option (repeatable)")
+        parser.add_argument("--file", "-f", action="append", default=[], dest="flag_files", metavar="JOB",
+                            help="the same as --job")
+        parser.add_argument("--pipeline", action="append", default=[], dest="flag_pipelines", metavar="JOB",
+                            help="the same as --job")
     else:
-        parser.add_argument("job", nargs="?", metavar="JOB", help="path to the job definition YAML file or directory")
-        parser.add_argument("--job", "-j", dest="flag_job", help="path to the job definition YAML file or directory")
-        parser.add_argument("--file", "-f", dest="flag_file", help="alias for --job")
-        parser.add_argument("--pipeline", dest="flag_pipeline", help="alias for --job")
-    parser.add_argument("--config", help="a YAML file with a `config:` mapping (values for spec.config)")
-    parser.add_argument(
-        "--set",
-        action="append",
-        default=[],
-        metavar="NAME=VALUE",
-        help="override a spec.config value (e.g. --set key=value)",
-    )
-    parser.add_argument("--overlay", action="append", default=[], help="YAML merged over the job; a null deletes a key")
-    parser.add_argument(
-        "--allow-connector", action="append", default=None, metavar="PROVIDER", help="only load these providers"
-    )
+        parser.add_argument("job", nargs="?", metavar="JOB", help=JOB_HELP["job"])
+        parser.add_argument("--job", "-j", dest="flag_job", metavar="JOB", help=JOB_HELP["job_option"])
+        parser.add_argument("--file", "-f", dest="flag_file", metavar="JOB", help="the same as --job")
+        parser.add_argument("--pipeline", dest="flag_pipeline", metavar="JOB", help="the same as --job")
+    if inputs:
+        parser.add_argument("--config", metavar="FILE", help=JOB_HELP["config"])
+        parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help=JOB_HELP["set"])
+    parser.add_argument("--overlay", action="append", default=[], metavar="FILE", help=JOB_HELP["overlay"])
+    parser.add_argument("--allow-connector", action="append", default=None, metavar="NAME",
+                        help=JOB_HELP["allow_connector"])
 
 
 def load_plugins(allow=None):

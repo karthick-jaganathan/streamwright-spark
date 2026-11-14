@@ -1,10 +1,30 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """The Spark state CLI reads and manages the shared jobs store."""
 
 from types import SimpleNamespace
 
+import pytest
+
 from streamwright.core.jobs import ExecutionResult, Runner
 from streamwright.core.jobs.state import open_sqlite
 from streamwright.spark.cli import state as state_cli
+from streamwright.spark.cli.main import main
 from streamwright.spark.job.rules import SparkRules
 
 
@@ -18,7 +38,7 @@ def test_state_cli_uses_core_schema_and_batch_fields(monkeypatch, tmp_path, caps
     monkeypatch.setattr(state_cli, "load_job", lambda path, overlays: job)
     monkeypatch.setattr(state_cli, "check_job", lambda job, adapters, launchers: ([], []))
     monkeypatch.setattr(state_cli, "config_values", lambda job, args: {})
-    monkeypatch.setattr(state_cli, "secret_values", lambda job, args: {})
+    monkeypatch.setattr(state_cli, "provided_secrets", lambda job, args: {})
     monkeypatch.setattr(state_cli, "resolve", lambda job, config, secrets: (job, []))
 
     def open_store(job, connections, adapters, base_dir):
@@ -26,20 +46,31 @@ def test_state_cli_uses_core_schema_and_batch_fields(monkeypatch, tmp_path, caps
         return store
 
     monkeypatch.setattr(state_cli, "open_store", open_store)
-    arguments = SimpleNamespace(
-        allow_connector=None, job=str(tmp_path / "job.yaml"), overlay=[], arg=None, action="init"
-    )
-    assert state_cli.run(arguments) == 0
+    job_path = str(tmp_path / "job.yaml")
+    assert main(["state", "migrate", job_path]) == 0
     assert store.schema_version() >= 1
     assert (
         Runner("sparkjob", store, SimpleNamespace(execute=lambda ctx, manifest, done, hooks: ExecutionResult())).run()
         == 0
     )
-    arguments.action = "batches"
-    assert state_cli.run(arguments) == 0
-    assert "seq=1" in capsys.readouterr().out
-    arguments.action, arguments.arg = "purge", "0"
-    assert state_cli.run(arguments) == 0
+    capsys.readouterr()
+    assert main(["state", "list", job_path]) == 0
+    out = capsys.readouterr().out
+    assert "sparkjob-00000001" in out and "completed" in out
+    assert main(["state", "show", "--job", job_path, "sparkjob-00000001"]) == 0
+    assert '"job_id": "sparkjob-00000001"' in (shown := capsys.readouterr().out) and '"sequence": 1' in shown
+    assert main(["state", "leases", job_path]) == 0
+    assert "<job>" in capsys.readouterr().out
+    assert main(["state", "purge", job_path, "--older-than", "30"]) == 0   # the age in days
+    assert "purged 0" in capsys.readouterr().out
+    assert main(["state", "purge", job_path, "--older-than", "0s"]) == 0
+    assert "purged 1" in capsys.readouterr().out
+    assert main(["state", "check", job_path]) == 0
+    for dropped in (["state", "init", job_path], ["state", "show", "--file", job_path, "sparkjob-00000001"],
+                    ["state", "list", job_path, "--log-level", "DEBUG"], ["state", "purge", job_path, "30"]):
+        with pytest.raises(SystemExit) as usage:                           # old names and options of no use here
+            main(dropped)
+        assert usage.value.code == 2
 
 
 def test_sqlite_state_resolves_relative_to_job_directory_not_current_directory(tmp_path, monkeypatch):

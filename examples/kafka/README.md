@@ -135,12 +135,12 @@ sw spark validate examples/kafka/order_files.yaml \
   --strict \
   --analyze
 
-# 2. Run a single batch (--once, with clean logs via --log-level ERROR)
+# 2. Run a single batch (--once, with quiet Spark logs via --spark-log-level ERROR)
 sw spark run examples/kafka/order_files.yaml \
   --overlay examples/kafka/order_files.local.yaml \
   --set kafka_bootstrap=127.0.0.1:9094 \
   --set lake_bucket=acme-lake \
-  --log-level ERROR \
+  --spark-log-level ERROR \
   --once
 
 # 3. Or run continuously in streaming follow mode (--follow)
@@ -148,7 +148,7 @@ sw spark run examples/kafka/order_files.yaml \
   --overlay examples/kafka/order_files.local.yaml \
   --set kafka_bootstrap=127.0.0.1:9094 \
   --set lake_bucket=acme-lake \
-  --log-level WARN \
+  --spark-log-level WARN \
   --follow \
   --interval 10s
 ```

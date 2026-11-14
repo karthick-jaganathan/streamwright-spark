@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 # vendored from streamwright/scripts/check_code_standards.py — keep identical (streamwright's CI compares the copies
 # in streamwright-spark and streamwright-mcp with it)
 """
@@ -11,8 +27,11 @@ The code standards ruff cannot check (StreamWright docs/design/connector-contrac
   global-statement       a `global` statement (unless its line says `# noqa: PLW0603`, as ruff takes it)
   function-import        an import inside a function (imports go at the module top), unless its line says
                          `# noqa: PLC0415` with the reason, as ruff takes it
-  module-too-long        a module of more than MAX_MODULE_LINES physical lines (split it by responsibility); tests
-                         (tests/ folders, test_*.py, conftest.py) are exempt
+  module-too-long        a module of more than MAX_MODULE_LINES physical lines after its license banner (split it by
+                         responsibility); tests (tests/ folders, test_*.py, conftest.py) are exempt
+  license-header         a file that does not open (after an optional #! line) with the Apache-2.0 banner:
+                         `# * Copyright YYYY Karthick Jaganathan` and the license notice, as in
+                         core/src/streamwright/core/jobs/state/tables/leases.py
 
 Usage: check_code_standards.py [--strict] [PATH ...]
 PATHs are relative to the working directory; by default the repository's Python packages (those of DEFAULT_PATHS
@@ -34,8 +53,11 @@ SKIPPED_PARTS = frozenset({"build", "_site", "__pycache__", ".venv", "node_modul
 MUTABLE_CALLS = frozenset({"dict", "list", "set", "defaultdict", "OrderedDict", "Counter", "deque"})
 MUTABLE_NODES = (ast.Dict, ast.List, ast.Set, ast.DictComp, ast.ListComp, ast.SetComp)
 SPECIAL_NAMES = frozenset({"__all__"})  # read by tools as a list by convention
-RULES = ("mutable-module-state", "global-statement", "function-import", "module-too-long")
+RULES = ("mutable-module-state", "global-statement", "function-import", "module-too-long", "license-header")
 MAX_MODULE_LINES = 400
+HEADER_LINES = 17                          # an optional #! line and the 15-line banner
+COPYRIGHT = re.compile(r"^# \* Copyright \d{4} Karthick Jaganathan$", re.MULTILINE)
+LICENSE_NOTICE = '# * Licensed under the Apache License, Version 2.0 (the "License");'
 NOQA = re.compile(r"#\s*noqa:\s*(?P<codes>[A-Z]+[0-9]+(?:\s*,\s*[A-Z]+[0-9]+)*)")
 
 
@@ -120,10 +142,23 @@ def _is_test(path: Path) -> bool:
     return "tests" in path.parts or path.name.startswith("test_") or path.name == "conftest.py"
 
 
+def _code_lines(lines: list[str]) -> int:
+    """The module's lines after its license banner (the banner is not code)."""
+    head = "\n".join(lines[:HEADER_LINES])
+    return len(lines) - (HEADER_LINES if COPYRIGHT.search(head) else 0)
+
+
 def _module_length(path: Path, shown: str, lines: list[str]) -> Iterator[Finding]:
-    if len(lines) > MAX_MODULE_LINES and not _is_test(path):
-        yield Finding(shown, 1, "module-too-long", "%d lines (at most %d: split it by responsibility)" % (
-            len(lines), MAX_MODULE_LINES))
+    count = _code_lines(lines)
+    if count > MAX_MODULE_LINES and not _is_test(path):
+        yield Finding(shown, 1, "module-too-long", "%d lines after the license banner (at most %d: split it by "
+                                                   "responsibility)" % (count, MAX_MODULE_LINES))
+
+
+def _license_header(shown: str, lines: list[str]) -> Iterator[Finding]:
+    head = "\n".join(lines[:HEADER_LINES])
+    if not COPYRIGHT.search(head) or LICENSE_NOTICE not in head:
+        yield Finding(shown, 1, "license-header", "no Apache-2.0 banner at the top (see leases.py)")
 
 
 def check_file(path: Path) -> list[Finding]:
@@ -133,7 +168,8 @@ def check_file(path: Path) -> list[Finding]:
     tree = ast.parse(text, filename=shown)
     visitor = _FunctionLevel(shown, lines)
     visitor.visit(tree)
-    findings = [*_module_length(path, shown, lines), *_module_state(shown, tree), *visitor.findings]
+    findings = [*_license_header(shown, lines), *_module_length(path, shown, lines), *_module_state(shown, tree),
+                *visitor.findings]
     return sorted(findings, key=lambda finding: finding.line)
 
 

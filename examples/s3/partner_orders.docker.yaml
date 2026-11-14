@@ -1,3 +1,19 @@
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 # ==============================================================================
 # Docker Compose Overlay for s3_partner_orders
 # ------------------------------------------------------------------------------
@@ -19,8 +35,6 @@ connections:
     endpoint: "localstack:4566"
     url_style: path
     use_ssl: false
-    key_id: "{{ secrets.s3_key_id }}"
-    secret: "{{ secrets.s3_secret }}"
 
   # ----------------------------------------------------------------------------
   # Redirect AWS S3 lake requests to LocalStack inside Docker network
@@ -29,8 +43,6 @@ connections:
     endpoint: "localstack:4566"
     url_style: path
     use_ssl: false
-    key_id: "{{ secrets.s3_key_id }}"
-    secret: "{{ secrets.s3_secret }}"
 
   # Delta Lake table inherits the redirected lake_s3 credentials
   lake_delta: {}
@@ -50,12 +62,11 @@ connections:
     user: sw
     sslmode: disable
 
-spec:
-  secrets:
-    s3_key_id: {type: string}
-    s3_secret: {type: string}
-
 runtime:
+  # A test environment: let the run create or upgrade the state tables (production applies them with
+  # `sw spark state migrate JOB` and runs without this)
+  state:
+    apply_migrations: true
   # Disable AWS Secrets Manager resolution in local Docker testing
   secrets: null
   artifacts: null

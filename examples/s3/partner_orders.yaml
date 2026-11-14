@@ -1,3 +1,19 @@
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 # ==============================================================================
 # Pipeline: Multi-Partner Schema Harmonization & Quality Routing
 # Engine:   StreamWright Spark (Distributed Batch Processing)
@@ -338,9 +354,9 @@ outputs:
   # - unmapped: ARRAY<STRING> of unrecognized column names
   # - missing_optional: ARRAY<STRING> of non-required columns missing from file
   #
-  # Parallel Bulk Append:
-  # `method: write` (mode append) writes rows directly across Spark executors using parallel JDBC.
-  # No staging table or driver transaction is required.
+  # Replay-Safe Merge:
+  # `method: write` with `mode: merge` stages the rows (parallel JDBC) and upserts them on the key in one driver
+  # transaction, so a batch replayed after a crash does not log its drift twice.
   # ============================================================================
   - name: schema_drift_audit_log
     connection: audit_db
@@ -348,6 +364,8 @@ outputs:
     method: write
     arguments:
       table: audit.schema_drift_events
+      mode: merge
+      primary_key: [batch_id, step, file_uri]
     sql: |
       SELECT
         step,
@@ -376,8 +394,8 @@ outputs:
   # - path: Rejected file URI
   # - reason: Detailed explanation (e.g. "no partner prefix matched")
   #
-  # Parallel Bulk Append:
-  # `method: write` (mode append) streams rows directly from executors via Spark JDBC.
+  # Replay-Safe Merge:
+  # `mode: merge` on the batch, step and file: a replayed batch updates its rejection rows instead of adding them.
   # ============================================================================
   - name: file_rejection_audit_log
     connection: audit_db
@@ -385,6 +403,8 @@ outputs:
     method: write
     arguments:
       table: audit.file_rejection_events
+      mode: merge
+      primary_key: [batch_id, step, file_uri]
     sql: |
       SELECT
         step,

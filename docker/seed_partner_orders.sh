@@ -1,4 +1,20 @@
 #!/bin/sh
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 # Seeds sample partner feeds and audit tables for the s3_partner_orders pipeline.
 # Run from repository root after `make up`:
 set -eu
@@ -24,7 +40,8 @@ CREATE TABLE IF NOT EXISTS audit.schema_drift_events (
     unmapped_columns TEXT,
     missing_optional_columns TEXT,
     batch_id TEXT,
-    detected_at TIMESTAMP
+    detected_at TIMESTAMP,
+    PRIMARY KEY (batch_id, step, file_uri)
 );
 
 CREATE TABLE IF NOT EXISTS audit.file_rejection_events (
@@ -32,8 +49,23 @@ CREATE TABLE IF NOT EXISTS audit.file_rejection_events (
     file_uri TEXT,
     reason TEXT,
     batch_id TEXT,
-    rejected_at TIMESTAMP
+    rejected_at TIMESTAMP,
+    PRIMARY KEY (batch_id, step, file_uri)
 );
+
+-- tables made by an earlier seed had no key: the job's merge outputs (ON CONFLICT) need it
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['schema_drift_events', 'file_rejection_events'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = ('audit.' || t)::regclass AND contype = 'p') THEN
+            EXECUTE format('DELETE FROM audit.%I WHERE batch_id IS NULL OR step IS NULL OR file_uri IS NULL', t);
+            EXECUTE format('DELETE FROM audit.%I a USING audit.%I b WHERE a.ctid < b.ctid AND a.batch_id = b.batch_id '
+                           'AND a.step = b.step AND a.file_uri = b.file_uri', t, t);
+            EXECUTE format('ALTER TABLE audit.%I ADD PRIMARY KEY (batch_id, step, file_uri)', t);
+        END IF;
+    END LOOP;
+END $$;
 SQL
 
 echo "==> Uploading partner test files to LocalStack S3..."

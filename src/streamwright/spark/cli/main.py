@@ -1,44 +1,104 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """
 `sw spark ...`. Entry points `streamwright-spark` / `sw-spark`; attaching it to `streamwright` core is a lazy
 dispatch like `streamwright mcp` (see README). Exit codes: 0 ok, 1 failed, 2 usage/validation, 130 interrupted.
-
-    sw spark validate PATH... [--config F] [--set K=V] [--overlay F] [--analyze] [--graph] [--strict] [--lock F]
-    sw spark run JOB [--config F] [--set K=V] [--secrets F] [--overlay F] [--once|--drain|--follow [--interval 10s]]
-                     [--max-messages N] [--run-key K] [--conf K=V] [--lock F] [--lock-required] [--dry-run] [--detach]
-    sw spark lock JOB --spark V [--out F] [--emr-release L] [--env-archive F] [--jar G:A=V] [--check]
-    sw spark state init|status|batches|show|retry|abandon|purge|lease JOB [ARG]
+Each command's options and examples: `sw spark COMMAND --help` (the descriptions below).
 """
 
 import argparse
 import sys
+from types import MappingProxyType
 
+from streamwright.core.cli.help_format import DescriptionFormatter
+from streamwright.core.cli.job_state import job_id_from_job
+from streamwright.core.cli.jobs import JOB_OPTION, resolve_job
+from streamwright.core.jobs.state import StateError
 from streamwright.spark.cli import lock, run, state, validate
 from streamwright.spark.cli.common import InputsError, add_job_arguments, err
 from streamwright.spark.cli.inputs import InputError
 from streamwright.spark.job import JobError
 from streamwright.spark.runtime.lock import LockError
 
-__all__ = ["main"]
+__all__ = ["build_parser", "main"]
 
+_DESCRIPTIONS = MappingProxyType({
+    "spark": """\
+Validate, plan, lock and run kind: SparkJob manifests on a Spark platform (runtime.platform: local, EMR, ...),
+and manage their batches. `sw validate|plan|run JOB` routes a SparkJob here too; this is the explicit form.
+Exit codes: 0 success, 1 invalid job or failed run, 2 usage or input error, 130 interrupted.""",
+    "validate": """\
+Check SparkJob manifests offline, without Spark, brokers or secret values: structure, inputs, connections
+(against the installed connectors' contracts), steps, outputs, references, runtime and platform.
+
+  sw spark validate jobs/orders.yaml --set client=acme --analyze
+  sw spark validate jobs/*.yaml --strict --lock orders.lock.json""",
+    "plan": """\
+Print a valid job's Spark actions, recomputation warnings and step dependencies (validate --analyze --graph).
+
+  sw spark plan jobs/orders.yaml""",
+    "run": """\
+Run a SparkJob on its platform: locally in this process, or submitted to a cluster (spark-submit, an EMR step).
+The batches its runtime.state scope left unfinished resume first, then new batches run. A job that consumes a
+broker (a step with method: consume, e.g. Kafka or SQS) polls a batch of messages, commits its outputs and
+outbox events, then acknowledges the messages; --drain, --available-now and --follow make more batches.
+
+  sw spark run jobs/orders.yaml --secrets secrets.yaml --set client=acme
+  sw spark run jobs/kafka_orders.yaml --available-now --max-messages 5000 --summary
+  sw spark run jobs/orders.yaml --lock orders.lock.json --lock-required --detach
+  sw spark run jobs/orders.yaml --dry-run""",
+    "lock": """\
+Write the job's dependency lock file: the Python, Spark and package versions installed here, and the JARs its
+connectors need, so a cluster runs the versions it was tested with. --check verifies an existing one instead.
+
+  sw spark lock jobs/orders.yaml --spark 3.5.3 --emr-release emr-7.2.0 --out orders.lock.json
+  sw spark lock jobs/orders.yaml --out orders.lock.json --check""",
+})
+
+# (name, help, the job options it takes: {many, inputs} or None when the command adds its own, its options, handler)
 _COMMANDS = (
-    ("validate", validate, "check jobs without Spark, brokers or credentials", True),
-    ("plan", validate, "show Spark actions and step dependencies without running the job", True),
-    ("run", run, "run a job", False),
-    ("lock", lock, "write or check the version lock", False),
-    ("state", state, "inspect and repair bookkeeping", None),
+    ("validate", "check jobs without Spark, brokers or credentials", {"many": True}, validate.add_arguments,
+     validate.run),
+    ("plan", "print the Spark actions and step dependencies (validate --analyze --graph)",
+     {"many": True}, validate.add_plan_arguments, None),
+    ("run", "run a SparkJob: resume unfinished batches, then run new ones", {}, run.add_arguments, run.run),
+    ("lock", "write or check the dependency lock file (package, Spark and JAR versions)", {"inputs": False},
+     lock.add_arguments, lock.run),
+    ("state", "list, show, retry, abandon or purge a job's batches; its leases; migrate or check its state tables",
+     None,
+     state.add_arguments, state.run),
 )
 
 
-def _parser():
+def build_parser():
+    """The `sw spark` argument parser (validate, plan, run, lock, state)."""
     # no prefix matching: an unknown --log must not be taken for --log-level (Spark's level)
-    parser = argparse.ArgumentParser(prog="sw spark", description="Spark jobs for StreamWright.", allow_abbrev=False)
-    sub = parser.add_subparsers(dest="command")
-    for name, module, help_text, many in _COMMANDS:
-        command = sub.add_parser(name, help=help_text, allow_abbrev=False)
-        if many is not None:
-            add_job_arguments(command, many)
-        module.add_arguments(command)
-        command.set_defaults(handler=_run_plan if name == "plan" else module.run)
+    raw = DescriptionFormatter
+    parser = argparse.ArgumentParser(prog="sw spark", description=_DESCRIPTIONS["spark"], formatter_class=raw,
+                                     allow_abbrev=False)
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    for name, help_text, job_options, add_arguments, handler in _COMMANDS:
+        command = sub.add_parser(name, help=help_text, description=_DESCRIPTIONS.get(name), formatter_class=raw,
+                                 allow_abbrev=False)
+        if job_options is not None:
+            add_job_arguments(command, **job_options)
+        add_arguments(command)
+        command.set_defaults(handler=handler or _run_plan)
     return parser
 
 
@@ -49,11 +109,18 @@ def _run_plan(args):
 
 
 def _normalize_job_args(args):
+    if getattr(args, "state_command", None):              # the shared state actions: core's JOB / --job
+        problem = job_id_from_job(args, getattr(args, JOB_OPTION, None))
+        if problem:
+            args.parser.error(problem)
+        resolve_job(args.parser, args)
+        return True
     if hasattr(args, "flag_job"):
         flag_val = args.flag_job or getattr(args, "flag_file", None) or getattr(args, "flag_pipeline", None)
         if flag_val:
-            if hasattr(args, "arg") and args.job and args.arg is None:
-                args.arg = args.job
+            if args.job and args.job != flag_val:
+                err("error: pass the job once: JOB or --job JOB")
+                return False
             args.job = flag_val
         elif not args.job:
             err("error: job is required (pass JOB positional argument or --job PATH)")
@@ -75,7 +142,7 @@ def _normalize_job_args(args):
 
 
 def main(argv=None):
-    parser = _parser()
+    parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "handler", None):
         parser.print_help()
@@ -87,6 +154,9 @@ def main(argv=None):
     except (JobError, InputError, InputsError, LockError) as exc:
         err("error: %s" % exc)
         return 2
+    except StateError as exc:                             # e.g. a migration is pending
+        err("error: %s" % exc)
+        return 1
     except KeyboardInterrupt:
         return 130
 

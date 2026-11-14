@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """SparkExecutor through the fenced core Runner; no live Spark process required."""
 
 import pytest
@@ -59,12 +76,14 @@ def test_spark_executor_replays_only_unreceipted_outputs(tmp_path, definition_ad
         FakeSpark(), job, {"sink": Connection("sink", "fake", {})}, {"fake": defined}, config={}, limits={}, state=store
     )
     adapter.crash_on = "second"
+    runner = Runner("sparkjob", store, executor, engine_metadata={"driver_host": "driver"})
     with pytest.raises(Crash):
-        Runner("sparkjob", store, executor, engine_metadata={"driver_host": "driver"}).run()
+        runner.run()
     assert adapter.written == ["first"]
-    assert store.get_batch("sparkjob", "sparkjob-00000001")["status"] == "processing"
-    assert sorted(store.get_receipts("sparkjob", "sparkjob-00000001")) == ["first"]
+    batch_id = runner.processed[0]
+    assert store.get_batch("sparkjob", batch_id)["status"] == "processing"
+    assert sorted(store.get_receipts("sparkjob", batch_id)) == ["first"]
     runner = Runner("sparkjob", store, executor, engine_metadata={"driver_host": "driver"})
     assert runner.run(max_messages=0) == 0
     assert adapter.written == ["first", "second"]
-    assert store.get_batch("sparkjob", "sparkjob-00000001")["status"] == "completed"
+    assert store.get_batch("sparkjob", batch_id)["status"] == "completed"

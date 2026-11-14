@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """The SparkJob `runtime` checks (state, env, Spark conf) and where it runs (platform, launcher, cluster secrets)."""
 
 import os
@@ -37,6 +54,15 @@ def check_runtime(job):
                     ("bad-env", ("runtime", "env", str(key)), "environment variables must be scalar values", False)
                 )
     spark = runtime.get("spark") if isinstance(runtime.get("spark"), dict) else {}
+    checkpoint_dir = (spark.get("conf") or {}).get("spark.checkpoint.dir")
+    for index, step in enumerate(job.get("steps") or ()):
+        if isinstance(step, dict) and step.get("checkpoint") and not checkpoint_dir:
+            found.append((
+                "checkpoint-dir",
+                ("steps", index, "checkpoint"),
+                "checkpoint requires runtime.spark.conf.spark.checkpoint.dir",
+                False,
+            ))
     for key in spark.get("conf") or {}:
         if not isinstance(key, str) or key in LAUNCHER_OWNED_CONF or not key.startswith("spark."):
             found.append(

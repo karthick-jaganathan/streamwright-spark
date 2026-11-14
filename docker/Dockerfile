@@ -1,15 +1,41 @@
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 # PROPOSED. Spark + Delta + the streamwright-spark package. The jars are verified against Maven Central's published .sha1
 # files at build time.
-# BASE needs Python >= 3.10 (streamwright requires it). `apache/spark:3.5.3-python3` is Python 3.8 and fails; the Java 17
-# Ubuntu image is used instead. The digest is the manifest-list digest Docker Hub reports for this tag (2024-09-27); the
-# Python version inside is checked below at build time, because the tag listing does not state it.
+# BASE is the Java 17 Ubuntu 22.04 image (`apache/spark:3.5.3-python3` is Python 3.8); Python 3.11 is installed below
+# and checked at build time. The digest is the manifest-list digest Docker Hub reports for this tag (2024-09-27).
 ARG BASE=apache/spark:3.5.3-scala2.12-java17-python3-ubuntu@sha256:a1f2c9dcecb36c0f5c342be340b368883cfaa1d7ab23e6e222c8a93157b73a74
 FROM ${BASE}
 
 USER root
+# Python 3.11 (streamwright needs >= 3.11; Ubuntu 22.04 ships 3.10 and only a 3.11 release candidate): from the
+# deadsnakes PPA, in a venv that is first on PATH and is PySpark's Python on the driver and the executors.
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends software-properties-common gpg-agent; \
+    add-apt-repository -y ppa:deadsnakes/ppa; \
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv; \
+    apt-get purge -y --auto-remove software-properties-common gpg-agent; \
+    rm -rf /var/lib/apt/lists/*; \
+    python3.11 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH PYSPARK_PYTHON=/opt/venv/bin/python PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python
 # fail fast, before any download, with a clear message
-RUN python3 -c "import sys; print('python', sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 10) else 'BASE has Python %d.%d; streamwright needs >= 3.10: choose another BASE' % sys.version_info[:2])" \
- && (python3 -m pip --version || (apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*))
+RUN python3 -c "import sys; print('python', sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 11) else 'python %d.%d; streamwright needs >= 3.11' % sys.version_info[:2])"
 
 ARG SPARK_VERSION=3.5.3
 ARG DELTA_VERSION=3.2.1

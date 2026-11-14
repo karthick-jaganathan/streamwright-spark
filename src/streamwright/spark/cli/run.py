@@ -1,117 +1,133 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """sw spark run: submit a job to its platform, or run the core batch loop on the driver."""
 
-import datetime
 import json
+import logging
 import os
-import re
-import sys
 from importlib import import_module, metadata
 
+from streamwright.core.cli.jobs import batch_mode
+from streamwright.core.cli.log_options import log_setup
+from streamwright.core.config.inputs import InputError, parse_duration
 from streamwright.core.jobs import BrokerCall, Runner
+from streamwright.core.jobs.inputs import effective_config
+from streamwright.core.jobs.inputs import secret_values as typed_secrets
+from streamwright.core.jobs.locking import applies_migrations, check_key, lock_plan, resolve_failed_job_policy
+from streamwright.core.jobs.log_labels import job_log_context
+from streamwright.core.jobs.lookups import Lookups, has_lookups, lookup_optional
+from streamwright.core.jobs.lookups.passes import run_passes
 from streamwright.core.jobs.manifest import manifest_directory
 from streamwright.core.jobs.refs import references
+from streamwright.core.jobs.state import StateError
+from streamwright.core.runtime import logs
+from streamwright.core.runtime.logs.lines import fields, utc_now
 from streamwright.core.runtime.redact import Redactor
 from streamwright.core.sdk.contract import InvalidConnectionError
-from streamwright.spark.cli.common import connections_of, err, load_plugins
-from streamwright.spark.cli.inputs import config_values, secret_values
+from streamwright.spark.cli.common import InputsError, connections_of, load_plugins
+from streamwright.spark.cli.inputs import config_values, provided_config, provided_secrets, secret_values
+from streamwright.spark.cli.run_options import add_arguments, check_options, driver_flags
+from streamwright.spark.cli.run_summary import summary, write_summary
 from streamwright.spark.cli.state import open_store
 from streamwright.spark.cli.submit_format import format_spark_submit
 from streamwright.spark.contracts import LaunchError, LaunchFailureError
 from streamwright.spark.io.messaging import open_broker
-from streamwright.spark.job import check_job, load_job, resolve
+from streamwright.spark.job import JobError, check_job, load_job, resolve
 from streamwright.spark.job.reader import resolve_job_location
 from streamwright.spark.plan import build_plan, role_of
 from streamwright.spark.runtime import lock as lockmod
 
-__all__ = ["add_arguments", "run"]
+__all__ = ["add_arguments", "run"]  # add_arguments: run_options
 
+LOG = logging.getLogger("streamwright.spark")
 
-def add_arguments(parser):
-    parser.add_argument("--secrets", help="path to a secrets YAML file or JSON string of secret values")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="one batch (default)")
-    mode.add_argument("--drain", action="store_true", help="batches until the source is empty")
-    mode.add_argument(
-        "--available-now",
-        action="store_true",
-        help="batches until messages available at launch are processed (Trigger.AvailableNow)",
-    )
-    mode.add_argument("--follow", action="store_true", help="keep polling until interrupted")
-    parser.add_argument("--interval", default="10s", help="polling interval when running with --follow (default: 10s)")
-    parser.add_argument(
-        "--max-messages", type=int, default=500, help="maximum messages per batch (0: recover and relay only)"
-    )
-    parser.add_argument("--run-key", help="idempotency key for jobs without a broker")
-    parser.add_argument(
-        "--conf",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Spark configuration override (e.g. --conf spark.executor.memory=4g)",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["ALL", "DEBUG", "ERROR", "FATAL", "INFO", "OFF", "TRACE", "WARN"],
-        type=str.upper,
-        help="Spark logging level (e.g. --log-level ERROR or WARN)",
-    )
-    parser.add_argument("--lock", help="path to the lock file to verify dependencies and versions against")
-    parser.add_argument("--lock-required", action="store_true", help="require a valid lock file before running")
-    parser.add_argument(
-        "--no-init-state",
-        action="store_true",
-        help="do not create the bookkeeping tables (they must exist: `sw spark state init JOB`)",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="resolve the job and print the launch submission without executing"
-    )
-    parser.add_argument(
-        "--detach", action="store_true", help="submit the job to the cluster launcher and exit without waiting"
-    )
-    parser.add_argument("--summary", action="store_true", help="print a summary of the executed batch upon completion")
-    parser.add_argument("--driver", action="store_true", help="internal: run on the cluster driver")
-
-
-def _seconds(text):
-    match = re.match(r"^([0-9]+)([smh])$", str(text))
-    if not match:
-        raise ValueError("invalid duration %r (expected e.g. 10s, 5m)" % (text,))
-    return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
 
 
 def run(args):
+    setup = log_setup(args)
+    if setup is None:
+        return 2
+    try:
+        return _run(args)
+    except (JobError, InputError, InputsError, lockmod.LockError) as exc:     # logged while the run's logging is set up
+        _error(exc)
+        return 2
+    except StateError as exc:                                          # e.g. a state migration is pending
+        _error(exc, event="state_error")
+        return 1
+    finally:
+        setup.close()
+
+
+def _error(message, event="run_refused"):
+    """A run's error: a log line (its format, handlers and redaction), not a bare print."""
+    LOG.error("%s", message, extra=fields(event=event, status="failed"))
+
+
+def _run(args):
     adapters, launchers, plugin_problems = load_plugins(args.allow_connector)
     job = load_job(args.job, args.overlay)
     problems, warnings = check_job(job, adapters, launchers)
     problems += plugin_problems
     for text in problems:
-        err("error: " + text)
+        _error(text)
     if problems:
         return 2
     for text in warnings:
-        err("warning: " + text)
-    config = config_values(job, args)
+        LOG.warning("%s", text, extra=fields(event="job_warning"))
+    config = config_values(lookup_optional(job), args)    # lookup-bound inputs are filled on the driver
     platform = job["runtime"]["platform"]
+    problem = logs.summary_problem(args.summary)
+    problems = check_options(args, platform) + ([problem] if problem else [])
+    for text in problems:
+        _error(text)
+    if problems:
+        return 2
     lock = lockmod.load(args.lock) if args.lock else None
-    if args.lock_required and lock is None and platform["type"] != "local":
-        err("error: --lock-required: no lock given")
+    if args.lock_required and lock is None:
+        _error("--lock-required: no dependency lock file given (--lock FILE)")
         return 2
     if args.dry_run:
         try:
             _preview_dry_run(job, adapters, args, lock=lock, platform=platform, launcher=launchers[platform["type"]])
         except LaunchError as exc:
-            err("error: %s" % exc)
+            _error(exc)
             return 2
         return 0
     if platform["type"] != "local" and not args.driver:
         placeholders = {name: "{{ secrets.%s }}" % name for name in ((job.get("spec") or {}).get("secrets") or {})}
-        submission, problems = resolve(job, config, placeholders)
+        later = {name: "{{ config.%s }}" % name for name, value in config.items() if value is None}
+        submission, problems = resolve(job, {**config, **later}, placeholders)
         if problems:
             for text in problems:
-                err("error: " + text)
+                _error(text)
             return 2
         return _submit(submission, args, lock, submission["runtime"]["platform"], launchers[platform["type"]])
-    return _drive(job, adapters, args, config, lock)
+    started, outcome, code, failure = utc_now(), {}, None, None
+    try:
+        code = _drive(job, adapters, args, config, lock, outcome=outcome)
+        return code
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        if args.summary:
+            write_summary(args, summary(args, outcome, started, code, failure))
 
 
 def _spark_conf(job, extra_conf):
@@ -139,33 +155,6 @@ def _spark_conf(job, extra_conf):
     return conf
 
 
-def _driver_flags(args):
-    flags = []
-    for path in args.overlay:
-        flags += ["--overlay", os.path.basename(path)]
-    for item in args.set:
-        flags += ["--set", item]
-    if args.config:
-        flags += ["--config", os.path.basename(args.config)]
-    flags += (
-        ["--follow"]
-        if args.follow
-        else ["--available-now"]
-        if getattr(args, "available_now", False)
-        else ["--drain"]
-        if args.drain
-        else ["--once"]
-    )
-    flags += ["--interval", args.interval, "--max-messages", str(args.max_messages)]
-    if args.run_key:
-        flags += ["--run-key", args.run_key]
-    if args.no_init_state:
-        flags += ["--no-init-state"]
-    if getattr(args, "log_level", None):
-        flags += ["--log-level", args.log_level]
-    return flags
-
-
 def _preview_dry_run(job, adapters, args, *, lock, platform, launcher):
     print("Execution Plan:")
     print(build_plan(job, adapters).describe())
@@ -173,7 +162,7 @@ def _preview_dry_run(job, adapters, args, *, lock, platform, launcher):
     conf = _spark_conf(job, args.conf)
     files = list(args.overlay) + ([args.config] if args.config else [])
     preview = launcher.preview(
-        args.job, _driver_flags(args), conf, lock or {}, platform=platform, lock_path=args.lock, files=files
+        args.job, driver_flags(args), conf, lock or {}, platform=platform, lock_path=args.lock, files=files
     )
     if preview.get("target"):
         print("  Target Cluster: %s" % preview["target"])
@@ -187,19 +176,19 @@ def _submit(job, args, lock, platform, launcher):
     try:
         conf = _spark_conf(job, args.conf)
     except LaunchError as exc:
-        err("error: %s" % exc)
+        _error(exc)
         return 2
     if getattr(args, "secrets", None):
-        err("error: --secrets is not delivered to cluster drivers; use runtime.secrets")
+        _error("--secrets is not delivered to cluster drivers; use runtime.secrets")
         return 2
-    flags = _driver_flags(args)
+    flags = driver_flags(args)
     env = (lock or {}).get("python_env") or {}
     archive = env.get("archive") if env.get("archive") and os.path.exists(env["archive"]) else None
     job_path = os.path.join(args.job, "job.yaml") if os.path.isdir(args.job) else resolve_job_location(args.job)
     try:
         lock_problems = launcher.check_lock(lock or {}, platform)
         for text in lock_problems:
-            err("error: " + text)
+            _error(text)
         if lock_problems:
             return 2
         files = list(args.overlay) + ([args.config] if args.config else [])
@@ -218,10 +207,10 @@ def _submit(job, args, lock, platform, launcher):
             files=files,
         )
     except LaunchFailureError as exc:
-        err("error: %s" % exc)
+        _error(exc)
         return 1
     except LaunchError as exc:
-        err("error: %s" % exc)
+        _error(exc)
         return 2
 
 
@@ -263,77 +252,134 @@ def _broker_calls(resolved, connections, adapters):
     return consumer, publishers
 
 
-def _drive(job, adapters, args, config, lock):
+def _drive(job, adapters, args, config, lock, *, outcome):
+    """On the driver: the run, or with spec.lookups its inputs looked up first (once per runtime.fan_out item)."""
+    if not has_lookups(job):
+        secrets = secret_values(job, args)
+        outcome["redact"] = Redactor(secrets.values())
+        with job_log_context(job, config):
+            return _drive_one(job, adapters, args, config, secrets, lock=lock, outcome=outcome)
+    redact = outcome["redact"] = Redactor()
+
+    def enrol(value):
+        if value not in (None, "") and not isinstance(value, bool):
+            redact.add(value)
+
+    lookups = Lookups(job, provided_config(args), provided_secrets(job, args), enrol=enrol,
+                      allow_exec=args.allow_lookup_exec, base_dir=manifest_directory(args.job))
+    if lookups.fan_out and int(args.fan_out_concurrency or lookups.fan_out["concurrency"]) > 1:
+        LOG.warning("fan_out: a SparkJob runs its items one at a time (concurrency 1)",
+                    extra=fields(event="fan_out_concurrency"))
+
+    def run_one(label, pass_config, pass_secrets):
+        secrets = typed_secrets(job, pass_secrets)
+        for value in secrets.values():
+            enrol(value)
+        part = outcome if lookups.fan_out is None else {"redact": redact}
+        with job_log_context(job, pass_config):
+            return _drive_one(job, adapters, args, effective_config(job, pass_config), secrets, lock=lock,
+                              outcome=part), part
+
+    outcomes = run_passes(lookups, run_one, concurrency=1, on_failure=args.fan_out_on_failure)
+    if lookups.fan_out is None:
+        return outcomes[0].exit_code
+    outcome.update(passes=outcomes, fan_out=lookups.fan_out, job=job["name"])
+    for item in outcomes:
+        runner = (item.result or {}).get("runner")
+        error = item.error or (runner.error if runner else None)
+        LOG.log(logging.INFO if item.status == "ok" else logging.WARNING, "%s %s %s%s", lookups.fan_out["as"],
+                item.label, item.status.replace("_", " "), ": %s" % redact(str(error)) if error else "",
+                extra=fields(event="pass_end", status=item.status))
+    return 1 if any(item.status != "ok" for item in outcomes) else 0
+
+
+def _drive_one(job, adapters, args, config, secrets, *, lock, outcome):
     """On the driver (local, or inside the cluster): verify, connect, run the batch loop. Needs Spark."""
     executor_type = import_module("streamwright.spark.engine.executor").SparkExecutor
     session_module = import_module("streamwright.spark.engine.session")
 
-    secrets = secret_values(job, args)
     resolved, problems = resolve(job, config, secrets)
     for text in problems:
-        err("error: " + text)
+        _error(text)
     if problems:
+        return 2
+    try:
+        state_lock = lock_plan(job, resolved, config, policy=getattr(args, "state_lock_policy", None),
+                         timeout=getattr(args, "state_lock_timeout", None))
+        failed_jobs = resolve_failed_job_policy(resolved, getattr(args, "failed_job_policy", None),
+                                                getattr(args, "max_job_attempts", None))
+        if _job_key(args, resolved) is not None:
+            check_key("the job key", _job_key(args, resolved))
+    except InputError as exc:
+        _error(exc)
         return 2
     for key, value in ((resolved.get("runtime") or {}).get("env") or {}).items():
         os.environ[key] = str(value)
     try:
         connections = connections_of(resolved, adapters=adapters, declared=job, config=config, secrets=secrets)
     except InvalidConnectionError as exc:
-        err("error: " + str(exc))
+        _error(exc)
+        return 2
+    if batch_mode(args) != "once" and args.max_messages and not any(role_of(resolved, step, adapters) == "consume"
+                                              for step in resolved.get("steps") or ()):
+        _error("--%s needs a job that consumes a broker (a step with method: consume): without one every batch "
+            "is new work and the run would not end" % batch_mode(args).replace("_", "-"))
         return 2
     mismatches = _verify_lock(lock)
     for text in mismatches:
-        err("error: lock: " + text)
+        _error("lock: " + text)
     if mismatches:
         return 2
     store = open_store(resolved, connections, adapters, manifest_directory(args.job))
-    if not args.no_init_state:
-        store.initialize()
+    store.prepare(migrate=applies_migrations(resolved, args.apply_state_migrations))
     try:
         _configure_driver_conf(resolved, args, secrets)
     except LaunchError as exc:
-        err("error: " + str(exc))
+        _error(exc)
         return 2
     spark = session_module.build_session(
         resolved,
         connections,
         adapters,
         local=resolved["runtime"]["platform"]["type"] == "local",
-        log_level=getattr(args, "log_level", None),
+        log_level=getattr(args, "spark_log_level", None),
     )
     app_id, driver_host = session_module.resolve_spark_metadata(spark)
-    executor = executor_type(
-        spark, resolved, connections, adapters, config=config, limits=resolved["runtime"].get("limits"),
-        state=store, declared_connections=(job.get("connections") or {}), secrets=secrets,
-        allowed_connectors=getattr(args, "allow_connector", None),
-    )
-    consumer, publishers = _broker_calls(resolved, connections, adapters)
-
-    def log(event, **fields):
-        print(
-            json.dumps(
-                dict(fields, event=event, ts=datetime.datetime.now(datetime.UTC).isoformat()), default=str
-            ),
-            file=sys.stderr,
+    def prepare(inputs):
+        """The executor of a batch, from its pinned config values (a lock input narrowed to its items)."""
+        pinned = effective_config(job, inputs["config"]) if inputs else config
+        pinned_job, problems = resolve(job, pinned, secrets) if inputs else (resolved, [])
+        if problems:
+            raise LaunchError("; ".join(problems))
+        return executor_type(
+            spark, pinned_job, connections, adapters, config=pinned, limits=pinned_job["runtime"].get("limits"),
+            state=store, declared_connections=(job.get("connections") or {}), secrets=secrets,
+            allowed_connectors=getattr(args, "allow_connector", None),
         )
 
-    mode = (
-        "follow"
-        if args.follow
-        else "available_now"
-        if getattr(args, "available_now", False)
-        else "drain"
-        if args.drain
-        else "once"
-    )
+    consumer, publishers = _broker_calls(resolved, connections, adapters)
+
+    mode = batch_mode(args)
     runner = Runner(
         resolved["name"],
         store,
-        executor,
+        None,
         consumer,
         publishers,
         redact=Redactor(secrets.values()),
-        log=log,
         engine_metadata={"app_id": app_id, "driver_host": driver_host},
+        scope=state_lock.scope,
+        lock=state_lock,
+        prepare=prepare,
+        failed_jobs=failed_jobs,
     )
-    return runner.run(mode, _seconds(args.interval), args.max_messages, args.run_key)
+    outcome.update(runner=runner, store=store, job=resolved["name"])
+    interval = parse_duration(args.interval or "10s").total_seconds()
+    return runner.run(mode, interval, args.max_messages, _job_key(args, resolved))
+
+
+def _job_key(args, job):
+    """--job-key, else runtime.state.job_key."""
+    if args.job_key is not None:
+        return args.job_key
+    return ((job.get("runtime") or {}).get("state") or {}).get("job_key")

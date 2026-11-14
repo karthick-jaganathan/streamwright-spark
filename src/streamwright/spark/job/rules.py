@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """Spark-only rule tables and adapter hooks for the shared jobs checker."""
 
 import re
@@ -7,6 +24,9 @@ from streamwright.core.jobs import JobRules
 from streamwright.core.jobs.calls import partition_problems
 from streamwright.core.jobs.check.rules import NAME_PATTERN, input_field
 from streamwright.core.jobs.fields import Field
+from streamwright.core.jobs.locking import STATE_FIELDS
+from streamwright.core.jobs.log_labels import LOG_FIELD
+from streamwright.core.jobs.lookups.rules import FAN_OUT_FIELD, LOOKUPS_FIELD
 from streamwright.core.jobs.policy import OUTPUT_POLICY_KEYS, STEP_POLICY_KEYS
 from streamwright.core.jobs.write_rules import OutputSpec, WriteTarget, warn_merge_scope
 from streamwright.core.runtime import components
@@ -97,13 +117,16 @@ class SparkRules(JobRules):
             **_POLICY_FIELDS,
         }
         runtime = _object(
-            state=_object(connection=_TEXT, schema=_TEXT, sqlite=_TEXT, ttl_seconds=Field("integer", minimum=1)),
+            state=_object(connection=_TEXT, schema=_TEXT, sqlite=_TEXT, ttl_seconds=Field("integer", minimum=1),
+                          **STATE_FIELDS),
             spark=_object(app_name=_TEXT, version=_TEXT, conf=Field("object")),
             platform=Field("object"),
             limits=Field("object"),
             env=Field("object"),
             secrets=Field("object"),
             artifacts=Field("object"),
+            fan_out=FAN_OUT_FIELD,
+            log=LOG_FIELD,
         )
         variants = {}
         for provider, adapter in self.adapters.items():
@@ -120,7 +143,8 @@ class SparkRules(JobRules):
             version=Field(("integer", "string")),
             name=Field("string", required=True, pattern=NAME_PATTERN),
             description=_TEXT,
-            spec=_object(config=Field("object", values=input_field()), secrets=Field("object", values=input_field())),
+            spec=_object(config=Field("object", values=input_field()), secrets=Field("object", values=input_field()),
+                         lookups=LOOKUPS_FIELD),
             connections=Field("object", required=True, min_items=1, values=connection),
             steps=Field("array", items=Field("object", fields=dict(item, partitions=_CALL_FIELDS["partitions"]))),
             outputs=Field(
@@ -196,8 +220,9 @@ class SparkRules(JobRules):
                 problems.append(
                     (
                         "not-idempotent",
-                        "write may fail or duplicate rows on replay; use a replay-safe "
-                        "mode (%s) or on_exists" % ", ".join(_REPLAY_SAFE_MODES),
+                        "write may fail or duplicate rows on replay; use a replay-safe mode (%s)%s"
+                        % (", ".join(_REPLAY_SAFE_MODES),
+                           " or on_exists" if operation.argument("on_exists") is not None else ""),
                         True,
                     )
                 )

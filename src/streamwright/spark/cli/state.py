@@ -1,26 +1,62 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """sw spark state: inspect and repair bookkeeping."""
 
-import datetime
-import json
+import contextlib
+import logging
 import os
 
+from streamwright.core.cli.job_state import add_state_commands, run_state_command
+from streamwright.core.cli.log_options import log_setup
+from streamwright.core.jobs import inputs as job_inputs
+from streamwright.core.jobs.locking import applies_migrations
+from streamwright.core.jobs.lookups import lookup_optional, state_inputs
 from streamwright.core.jobs.manifest import manifest_directory
-from streamwright.core.jobs.state import open_sqlite
+from streamwright.core.jobs.state import StateError, open_sqlite
 from streamwright.core.jobs.state import open_store as open_dialect
-from streamwright.spark.cli.common import add_job_arguments, connections_of, err, load_plugins
-from streamwright.spark.cli.inputs import config_values, secret_values
+from streamwright.core.jobs.state.target import describe_connection
+from streamwright.core.runtime.logs.lines import fields
+from streamwright.spark.cli.common import connections_of, load_plugins
+from streamwright.spark.cli.inputs import config_values, provided_config, provided_secrets
 from streamwright.spark.job import check_job, load_job, resolve
 
 __all__ = ["add_arguments", "open_store", "run"]
 
-ACTIONS = ("init", "status", "batches", "show", "retry", "abandon", "purge", "lease")
+LOG = logging.getLogger("streamwright.spark")
+
+DESCRIPTION = """\
+A SparkJob's batches, leases and state tables, in its runtime.state (sqlite, or a connection), per
+runtime.state.scope. Every action takes the job and its config values (--config/--set select the scope for status,
+and render the state connection); only the secrets of the state connection are needed. A retried batch resumes at
+the job's next run, with the config values and lock tokens it pinned; show, retry and abandon take its job id (as
+`state list` shows it); retry and abandon fail while a run of its scope holds them."""
+
+
+class _InvalidJobError(Exception):
+    """The job cannot be opened: its problems."""
+
+    def __init__(self, problems):
+        super().__init__("; ".join(problems))
+        self.problems = problems
 
 
 def add_arguments(parser):
-    parser.add_argument("action", choices=ACTIONS, help="state action to perform: " + ", ".join(ACTIONS))
-    add_job_arguments(parser)  # `state status JOB [ARG]`
-    parser.add_argument("arg", nargs="?", help="optional argument for action (e.g. batch_id for show/retry/abandon)")
-    parser.add_argument("--secrets", help="path to a secrets YAML file or JSON string of secret values")
+    add_state_commands(parser, description=DESCRIPTION)
 
 
 def open_store(resolved, connections, adapters, base_dir):
@@ -35,99 +71,46 @@ def open_store(resolved, connections, adapters, base_dir):
         return open_sqlite(path)
     conn = connections[state["connection"]]
     connect, dialect = adapters[conn.provider].state_connection(conn.auth)
-    return open_dialect(connect, dialect, schema=state.get("schema", "streamwright"))
+    schema = state.get("schema", "streamwright")
+    return open_dialect(connect, dialect, schema=schema,
+                        target=describe_connection(state["connection"], conn.provider, conn.auth, schema))
 
 
-def run(args):
+@contextlib.contextmanager
+def _open_state(args, initialize):
     adapters, launchers, _ = load_plugins(args.allow_connector)
     job = load_job(args.job, args.overlay)
     problems, _ = check_job(job, adapters, launchers)
     if problems:
-        for text in problems:
-            err("error: " + text)
-        return 2
+        raise _InvalidJobError(problems)
+    given, bound = state_inputs(job, provided_config(args), provided_secrets(job, args),
+                                allow_exec=args.allow_lookup_exec, base_dir=manifest_directory(args.job))
+    job = lookup_optional(job)
     config = config_values(job, args)
-    secrets = secret_values(job, args)
+    secrets = job_inputs.state_secrets(job, given)
     resolved, missing = resolve(job, config, secrets)
+    missing = [text for text in missing if text.split(" ", 1)[0] not in bound]  # e.g. a scope from a fan_out item
     if missing:
-        for text in missing:
-            err("error: " + text)
-        return 2
+        raise _InvalidJobError(missing)
     connections = connections_of(resolved, adapters=adapters, declared=job, config=config, secrets=secrets)
     store = open_store(resolved, connections, adapters, manifest_directory(args.job))
-    return _run_action(store, job["name"], args)
+    if initialize:
+        store.prepare(migrate=applies_migrations(resolved))
+    yield resolved["name"], store, resolved["runtime"]["state"].get("scope") or ""
 
 
-def _list_batches(store, name, limit):
-    for batch in store.list_batches(name, limit):
-        metadata = batch.get("engine_metadata") or {}
-        meta = [
-            f"{label}={metadata[key]}"
-            for key, label in (("app_id", "app"), ("driver_host", "host"))
-            if metadata.get(key)
-        ]
-        meta_str = (" " + " ".join(meta)) if meta else ""
-        print(
-            "%-24s %-10s seq=%d updated=%s%s %s"
-            % (
-                batch["batch_id"],
-                batch["status"],
-                batch["batch_sequence"],
-                batch["updated_at"],
-                meta_str,
-                (batch["error"] or "")[:80],
-            )
-        )
-
-
-def _show_batch(store, name, batch_id):
-    batch = store.get_batch(name, batch_id)
-    if batch is None:
-        err("no such batch")
+def run(args):
+    setup = log_setup(args)
+    if setup is None:
         return 2
-    manifest = dict(batch["manifest"], messages="%d message(s)" % len(batch["manifest"].get("messages", [])))
-    print(
-        json.dumps(
-            dict(batch, manifest=manifest, receipts=store.get_receipts(name, batch["batch_id"])), indent=2, default=str
-        )
-    )
-    return 0
-
-
-def _change_batch(store, name, args):
-    lease = store.acquire_lease(name, "cli:%d" % os.getpid(), 60)
     try:
-        batch = store.get_batch(name, args.arg or "")
-        if batch is None:
-            err("no such batch")
-            return 2
-        if args.action == "retry":
-            store.retry_batch(lease, batch["batch_id"])
-        else:
-            store.record_batch(lease, batch["batch_id"], "abandoned", batch["manifest"])
-        print("%s: %s" % (batch["batch_id"], "queued for retry" if args.action == "retry" else "abandoned"))
+        return run_state_command(args, _open_state)
+    except _InvalidJobError as exc:
+        for text in exc.problems:
+            LOG.error("%s", text, extra=fields(event="job_invalid", status="failed"))
+        return 2
+    except StateError as exc:                             # e.g. a state migration is pending
+        LOG.error("%s", exc, extra=fields(event="state_error", status="failed"))
+        return 1
     finally:
-        store.release_lease(lease)
-    return 0
-
-
-def _run_action(store, name, args):
-    if args.action == "init":
-        store.initialize()
-        print("initialized")
-    elif args.action in ("status", "batches"):
-        _list_batches(store, name, 1 if args.action == "status" else 20)
-    elif args.action == "show":
-        return _show_batch(store, name, args.arg or "")
-    elif args.action == "lease":
-        lease = store.get_lease(name)
-        if lease is None:
-            print("no lease recorded for %s" % name)
-        else:
-            print(json.dumps(lease, indent=2))
-    elif args.action in ("retry", "abandon"):
-        return _change_batch(store, name, args)
-    elif args.action == "purge":
-        cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=int(args.arg or 30))
-        print("purged %d batch(es)" % store.purge_batches(name, cutoff))
-    return 0
+        setup.close()

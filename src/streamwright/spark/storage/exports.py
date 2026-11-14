@@ -1,3 +1,20 @@
+#!/usr/bin/env python
+# /*************************************************************************
+# * Copyright 2026 Karthick Jaganathan
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# **************************************************************************/
+
 """
 Split exports: one file per distinct combination of `split_by`, named by the shared naming templates.
 
@@ -7,7 +24,8 @@ How, with a single Spark action:
      staging folder `<path>/_sw_staging/<batch_id>/`  (the one action; the row count comes from observe)
   3. on the driver (file-system calls, no Spark job): list the staging folder, read the split values from the folder
      names, render every final name with `naming.plan_names`, check collisions, max_splits and on_exists for ALL
-     splits, and only then rename the files into place and delete the staging folder
+     splits, and only then rename the files into place and delete the staging folder (and `_sw_staging` itself once no
+     other batch stages there)
 A failure before step 3 publishes nothing. A failure during step 3 leaves some files in place; because names come from
 the batch id and the pinned batch time, replaying the batch rewrites the same names.
 """
@@ -112,6 +130,8 @@ def write_split_export(spark, frame, ctx, output, arguments, *, root_uri, file_t
     finally:
         with contextlib.suppress(Exception):
             fs.delete(path_cls(staging), True)
+        with contextlib.suppress(Exception):  # the staging root, once empty (another batch's staging keeps it)
+            fs.delete(path_cls(root_uri.rstrip("/") + "/" + STAGING), False)
 
 
 def _filesystem(spark, uri):
