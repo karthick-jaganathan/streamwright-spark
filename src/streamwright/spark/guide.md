@@ -95,7 +95,7 @@ to the Spark cluster.
 looked up on the driver before anything connects, and the job runs once per account in its own
 scope. A SparkJob runs its accounts one at a time (one SparkSession). On a cluster the lookups run
 on the driver: the command must exist there, the function must be in the shipped environment.
-`sw spark run JOB --set client_id=c42 --allow-lookup-exec` (forwarded to the driver).
+`sw spark run JOB --set tenant_id=t1 --allow-lookup-exec` (forwarded to the driver).
 
 The driver's log lines carry the same log context and `runtime.log.labels` as a DuckDBJob's
 (`get_engine_guide("DuckDBJob", "Log context and labels")`); JVM lines do not.
