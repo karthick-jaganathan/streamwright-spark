@@ -55,11 +55,11 @@ Print a valid job's Spark actions, recomputation warnings and step dependencies 
     "run": """\
 Run a SparkJob on its platform: locally in this process, or submitted to a cluster (spark-submit, an EMR step).
 The batches its runtime.state scope left unfinished resume first, then new batches run. A job that consumes a
-broker (a step with method: consume, e.g. Kafka or SQS) polls a batch of messages, commits its outputs and
+broker (a step with method: consume) polls a batch of messages, commits its outputs and
 outbox events, then acknowledges the messages; --drain, --available-now and --follow make more batches.
 
   sw spark run jobs/orders.yaml --secrets secrets.yaml --set client=acme
-  sw spark run jobs/kafka_orders.yaml --available-now --max-messages 5000 --summary
+  sw spark run jobs/order_events.yaml --available-now --max-messages 5000 --summary
   sw spark run jobs/orders.yaml --lock orders.lock.json --lock-required --detach
   sw spark run jobs/orders.yaml --dry-run""",
     "lock": """\
