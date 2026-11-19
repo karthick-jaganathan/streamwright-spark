@@ -197,7 +197,7 @@ def read_files(context: SparkContext, arguments, *, location: FileLocation):
     return frame if frame is not None else _empty_frame(context, arguments)
 
 
-def write_files(context: SparkContext, frame, arguments, *, location: FileLocation, tokens=()):
+def write_files(context: SparkContext, frame, arguments, *, location: FileLocation):
     """Write a frame once, returning the core receipt used by replay and bookkeeping."""
     runtime = context.runtime
     root = location.resolve_path(runtime.text(arguments["path"]))
@@ -205,7 +205,7 @@ def write_files(context: SparkContext, frame, arguments, *, location: FileLocati
     format_name = arguments["format"]
     if arguments.get("split_by") or arguments.get("layout") or arguments.get("file_name"):
         columns = list(arguments.get("split_by") or [])
-        constants = ("driver_host", *tuple(tokens))
+        constants = ("driver_host",)
         file_template = naming.parse_template(arguments["file_name"], columns, False, "file_name", constants=constants)
         layout_template = (
             naming.parse_template(arguments["layout"], columns, True, "layout", constants=constants)

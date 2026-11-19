@@ -19,6 +19,7 @@
 
 from streamwright.core.jobs import BatchContext
 from streamwright.spark.engine.runtime import StepRuntime
+from streamwright.spark.job.vocabulary import BUILTIN_REFERENCES
 
 
 def test_runtime_uses_pinned_values_and_spark_literal_escaping():
@@ -28,3 +29,13 @@ def test_runtime_uses_pinned_values_and_spark_literal_escaping():
     runtime = StepRuntime(None, context, manifest, {}, {}, limits={})
     assert runtime.text("{{ batch.seq }}-{{ driver.host }}") == "7-driver.internal"
     assert runtime.predicate("name IN ({{ rows.name }})") == "name IN ('a\\\\b''c')"
+
+
+def test_every_accepted_constant_is_rendered_in_paths_and_predicates():
+    context = BatchContext("batch-07", 7, "2026-10-17T00:00:00Z", "job", 1, "store-id", {"driver_host": "d"})
+    runtime = StepRuntime(None, context, {}, {}, {}, limits={})
+    for name in BUILTIN_REFERENCES:
+        assert "{{" not in runtime.text("x/{{ %s }}/{{%s}}" % (name, name)), name
+        assert "{{" not in runtime.predicate("x = {{ %s }}" % name), name
+    assert runtime.text("{{ batch.ts }}/{{ batch.id_safe }}") == "2026-10-17T00:00:00Z/batch_07"
+    assert runtime.predicate("seq = {{ batch.seq }}") == "seq = 7"

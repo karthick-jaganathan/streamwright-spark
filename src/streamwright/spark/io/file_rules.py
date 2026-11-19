@@ -143,7 +143,7 @@ def check_read(arguments):
     return problems
 
 
-def check_write(arguments, tokens=()):
+def check_write(arguments):
     problems = _check_path(arguments.get("path")) + _check_options(arguments.get("options"))
     split_by = arguments.get("split_by") or []
     if not isinstance(split_by, list) or not all(
@@ -155,7 +155,7 @@ def check_write(arguments, tokens=()):
         if arguments.get(key) is not None:
             try:
                 parsed[key] = naming.parse_template(
-                    arguments[key], split_by, slash, key, constants=("driver_host", *tuple(tokens))
+                    arguments[key], split_by, slash, key, constants=("driver_host",)
                 )
             except naming.NamingError as exc:
                 problems.append(str(exc))
@@ -166,13 +166,24 @@ def check_write(arguments, tokens=()):
     unused = [col for col in split_by if not any(col in template.columns for template in parsed.values())]
     if split_by and parsed and unused:
         problems.append("split_by column(s) {} appear in neither file_name nor layout".format(", ".join(unused)))
-    path = str(arguments.get("path", ""))
-    uses_batch = bool(re.search(r"\{\{\s*batch\.id\s*\}\}", path)) or any(
-        part.kind == "batch_id" for template in parsed.values() for part in template.parts
-    )
-    if arguments.get("mode") == "append" and not uses_batch:
-        problems.append("mode append is not replay-safe; put {{ batch.id }} in path or {batch_id} in a name")
+    if arguments.get("mode") == "append":
+        problems.extend(_check_append(arguments, parsed))
     return problems
+
+
+def _check_append(arguments, parsed):
+    """
+    `mode: append` is replay-safe only for named files of the batch ({batch_id} in a name, or {{ batch.id }} in
+    path), which a replay writes under the same names: Spark's own part-* files get new names on every attempt, so a
+    replayed batch would add its rows again.
+    """
+    if not (arguments.get("split_by") or arguments.get("layout") or arguments.get("file_name")):
+        return ["mode append adds new part-* files on every attempt, so a replayed batch duplicates its rows; write "
+                "a folder of the batch with mode overwrite (path: .../{{ batch.id }}/)"]
+    in_path = bool(re.search(r"\{\{\s*batch\.id\s*\}\}", str(arguments.get("path", ""))))
+    if not in_path and not any(part.kind == "batch_id" for template in parsed.values() for part in template.parts):
+        return ["mode append is not replay-safe; put {{ batch.id }} in path or {batch_id} in a name"]
+    return []
 
 
 CAPABILITIES: Final = EngineCapabilities(

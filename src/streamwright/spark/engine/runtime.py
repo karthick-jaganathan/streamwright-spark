@@ -26,6 +26,7 @@ helpers (driver side, no Spark job), and SQL-literal rendering for predicates.
 from streamwright.core.jobs import refs
 from streamwright.core.jobs.refs import references
 from streamwright.spark.io.sql import quote_literal
+from streamwright.spark.job.vocabulary import limit
 
 __all__ = ["StepRuntime"]
 
@@ -35,10 +36,9 @@ class StepRuntime:
         self.spark, self.ctx = spark, ctx
         self.pinned = manifest.setdefault("pinned", {})
         self.connections, self.adapters = connections, adapters
-        self.cap = int((limits or {}).get("reference_values", 10000))
-        self.max_groups = int((limits or {}).get("read_groups", 200))
-        self.listing_parallelism = min(64, max(1, int((limits or {}).get("listing_parallelism", 16))))
-        self.max_files_per_batch = int((limits or {}).get("max_files_per_batch", 2000))
+        self.cap = limit(limits, "reference_values")
+        self.max_groups = limit(limits, "read_groups")
+        self.max_files_per_batch = limit(limits, "max_files_per_batch")
         self.file_errors = []
         self.schema_reports = []
         self.state = state
@@ -83,44 +83,28 @@ class StepRuntime:
 
     # --- text and predicates ---------------------------------------------------------------------------------
 
+    def builtins(self):
+        """The `{{ }}` constants of the batch (job.vocabulary.BUILTIN_REFERENCES), by name."""
+        host = self.ctx.engine_metadata.get("driver_host") or "unknown"
+        return {"batch.id": self.ctx.batch_id, "batch.ts": self.ctx.batch_ts,
+                "batch.id_safe": self.ctx.batch_id.replace("-", "_"), "batch.seq": self.ctx.batch_sequence,
+                "driver.host": host, "driver_host": host}
+
     def text(self, value, extra=None):
-        """Substitute path/name tokens ({{ batch.id }}, {{ driver.host }}, {{ uuid }}), never SQL."""
+        """Substitute the batch constants and `extra` tokens (paths, names: {{ batch.id }}, {{ uuid }}), never SQL."""
         if not isinstance(value, str):
             return value
-        v = value.replace("{{ batch.id }}", self.ctx.batch_id).replace("{{batch.id}}", self.ctx.batch_id)
-        sanitized_batch = self.ctx.batch_id.replace("-", "_")
-        v = v.replace("{{ batch.id_safe }}", sanitized_batch).replace("{{batch.id_safe}}", sanitized_batch)
-        v = v.replace("{{ batch.seq }}", str(self.ctx.batch_sequence)).replace(
-            "{{batch.seq}}", str(self.ctx.batch_sequence)
-        )
-        d_host = self.ctx.engine_metadata.get("driver_host") or "unknown"
-        v = (
-            v.replace("{{ driver.host }}", d_host)
-            .replace("{{driver.host}}", d_host)
-            .replace("{{ driver_host }}", d_host)
-            .replace("{{driver_host}}", d_host)
-        )
-        if extra and isinstance(extra, dict):
-            for k, val in extra.items():
-                v = v.replace("{{ %s }}" % k, str(val)).replace("{{%s}}" % k, str(val))
-        return v
+        tokens = dict(self.builtins(), **(extra if isinstance(extra, dict) else {}))
+        for name, token in tokens.items():
+            value = value.replace("{{ %s }}" % name, str(token)).replace("{{%s}}" % name, str(token))
+        return value
 
     def predicate(self, text):
         """A SQL fragment with {{ step.column }} rendered as escaped literals from the pinned values."""
-        values = {(s, c): self.values(s, c) for s, c in refs.step_columns_used(text)}
-        d_host = self.ctx.engine_metadata.get("driver_host") or "unknown"
-        return refs.substitute(
-            text,
-            values,
-            {
-                "batch.id": self.ctx.batch_id,
-                "batch.ts": self.ctx.batch_ts,
-                "driver.host": d_host,
-                "driver_host": d_host,
-            },
-            self.cap,
-            quote_text=quote_literal,
-        )
+        constants = self.builtins()
+        values = {(step, column): self.values(step, column) for step, column in refs.step_columns_used(text)
+                  if "%s.%s" % (step, column) not in constants}
+        return refs.substitute(text, values, constants, self.cap, quote_text=quote_literal)
 
     # --- connections -----------------------------------------------------------------------------------------
 

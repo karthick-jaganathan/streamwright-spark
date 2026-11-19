@@ -19,23 +19,50 @@
 
 import re
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+
 from streamwright.core.jobs.calls import partition_dependencies
-from streamwright.core.jobs.plan import Node, Plan, item_dependencies, sql_table_reads
+from streamwright.core.jobs.plan import Node, Plan, PlanError, item_dependencies
 from streamwright.core.jobs.plan import build_plan as core_plan
 from streamwright.core.jobs.refs import references
 
-__all__ = ["Node", "Plan", "build_plan", "role_of"]
+__all__ = ["Node", "Plan", "build_plan", "dependencies", "role_of", "spark_table_reads", "sql_parameters"]
 
-_PARAMETER = re.compile(r"(?<![:\w]):[A-Za-z_][A-Za-z0-9_]*")
+_PARAMETER = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")   # a Spark SQL named parameter, :name
+_QUOTED = re.compile(r"'(?:[^']|'')*'")
 _EXPENSIVE = re.compile(r"\b(join|group\s+by|union|distinct|over)\b", re.I)
 
 
-def _spark_reads(sql):
-    return sql_table_reads(_PARAMETER.sub("'value'", sql))
+def sql_parameters(sql):
+    """The :name parameters of a Spark SQL text (outside its quoted literals)."""
+    return _PARAMETER.findall(_QUOTED.sub("''", sql))
 
 
-def _dependencies(item):
-    return item_dependencies(item, reads_of=_spark_reads) + partition_dependencies(item)
+def spark_table_reads(sql):
+    """
+    Lower-case unqualified tables a Spark SQL query reads, excluding CTE names (the Spark-dialect counterpart of core's
+    sql_table_reads: LATERAL VIEW, DISTRIBUTE BY, CLUSTER BY and the other Spark-only clauses parse).
+    """
+    try:
+        statements = [statement for statement in sqlglot.parse(sql, dialect="spark") if statement is not None]
+    except SqlglotError as exc:
+        raise PlanError("cannot read the query: %s" % str(exc).splitlines()[0]) from None
+    if len(statements) != 1 or not isinstance(statements[0], (exp.Query, exp.Values)):
+        raise PlanError("cannot read the query: not one SELECT")
+    tree = statements[0]
+    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    return {
+        table.name.lower() for table in tree.find_all(exp.Table)
+        if isinstance(table.this, exp.Identifier) and not table.db and not table.catalog
+        and table.find_ancestor(exp.Hint) is None and table.name.lower() not in ctes
+    }
+
+
+def dependencies(item):
+    """What a step or output reads: its Spark SQL's tables, `{{ step[.column] }}` references and partitions."""
+    return item_dependencies(item, reads_of=spark_table_reads) + partition_dependencies(item)
 
 
 def role_of(job, item, adapters):
@@ -170,7 +197,7 @@ def _explain_node(job, plan, node, adapters, referenced):
 
 
 def build_plan(job, adapters=None):
-    plan = core_plan(job, _dependencies)
+    plan = core_plan(job, dependencies)
     _annotate_nodes(plan)
     _mark_local_steps(job, plan, adapters)
     _assign_evaluation_roots(plan)

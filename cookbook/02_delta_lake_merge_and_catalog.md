@@ -16,14 +16,15 @@ StreamWright Spark allows declaring a `target_predicate` with pinned upstream va
 outputs:
   - name: merge_orders
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3a://{{ config.lake_bucket }}/delta/orders"
-      partition_by: [client_id, event_date]
-      condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
-      target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3a://{{ config.lake_bucket }}/delta/orders"
+        partition_by: [client_id, event_date]
+        condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
+        target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
 ```
 
 - `{{ processed_orders.event_date }}` evaluates the distinct dates present in the current incoming micro-batch (e.g. `'2026-10-17'`).
@@ -85,20 +86,21 @@ StreamWright automatically manages catalog registration in Hive Metastore or Del
 outputs:
   - name: merge_orders
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3a://{{ config.lake_bucket }}/delta/orders"
-      table_name: orders
-      schema: analytics
-      schema_location: "s3a://{{ config.lake_bucket }}/analytics"
-      schema_comment: "Central enterprise analytics data mart for orders and reporting"
-      table_properties:
-        "delta.autoOptimize.optimizeWrite": "true"
-        "delta.autoOptimize.autoCompact": "true"
-      comment: "Central orders table with partitioned Bronze storage"
-      partition_by: [client_id, event_date]
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3a://{{ config.lake_bucket }}/delta/orders"
+        table_name: orders
+        schema: analytics
+        schema_location: "s3a://{{ config.lake_bucket }}/analytics"
+        schema_comment: "Central enterprise analytics data mart for orders and reporting"
+        table_properties:
+          "delta.autoOptimize.optimizeWrite": "true"
+          "delta.autoOptimize.autoCompact": "true"
+        comment: "Central orders table with partitioned Bronze storage"
+        partition_by: [client_id, event_date]
 ```
 
 ### Features

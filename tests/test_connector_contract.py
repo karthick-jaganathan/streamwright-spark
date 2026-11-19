@@ -59,7 +59,7 @@ def test_definition_is_loaded_from_the_only_connector_group(monkeypatch):
     assert calls == ["streamwright.connectors"]
 
 
-def test_definition_checks_connection_and_operation_without_legacy_tables():
+def test_definition_checks_connection_and_operation():
     rules = SparkRules({"s3": DefinedAdapter(CONNECTOR, S3SparkAdapter())})
     connection = {"provider": "s3", "roots": ["s3://landing/events/"]}
     assert rules.check_connection("landing", connection) == []

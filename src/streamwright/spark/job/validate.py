@@ -22,6 +22,7 @@ from collections.abc import Mapping
 
 from streamwright.core.jobs import JobReport
 from streamwright.core.jobs import validate_job as validate_shared_job
+from streamwright.core.jobs.grammar import to_internal
 from streamwright.core.jobs.manifest import JobError, load_job_text, merge_overlay
 from streamwright.core.runtime import components
 from streamwright.core.validation import Issue
@@ -68,7 +69,7 @@ def _validate(raw, *, allow, lock, strict, config):
         issue.severity == "error" or (strict and issue.severity == "warning") for issue in report.issues
     )
     if report.valid:
-        report.plan = build_plan(job, adapters).describe()
+        report.plan = build_plan(to_internal(job), adapters).describe()
     return report
 
 

@@ -210,6 +210,7 @@ def test_a_named_staging_table_is_truncated_and_renders_its_tokens(monkeypatch):
 
 
 def test_a_replayed_delta_append_returns_its_own_commit_without_writing(monkeypatch):
+    monkeypatch.setattr(delta, "_snapshot", lambda *args: None)      # a delta-spark without the snapshot API
     monkeypatch.setattr(delta, "_find_commit", lambda *args: (17, {"numOutputRows": "9"}))
     monkeypatch.setattr(delta, "_writer", lambda *args: pytest.fail("a replay must not write"))
     monkeypatch.setattr(delta, "_register", lambda *args: None)
@@ -224,10 +225,63 @@ def test_a_delta_append_transaction_key_includes_the_store_identity(monkeypatch)
         captured["app_id"], captured["transaction"] = app_id, transaction
         return (3, {"numOutputRows": "5"})           # pretend already committed so no real write happens
 
+    monkeypatch.setattr(delta, "_snapshot", lambda *args: None)
     monkeypatch.setattr(delta, "_find_commit", find_commit)
     monkeypatch.setattr(delta, "_register", lambda *args: None)
     delta.write_table(_context("store-xyz"), None, {}, path="file:///table", defaults={})
     assert captured == {"app_id": "job:out:store-xyz", "transaction": 7}
+
+
+class _Snapshot:
+    """A Delta snapshot: its version and SetTransactions (appId -> txnVersion)."""
+
+    def __init__(self, version, transactions):
+        self._version, self._transactions = version, transactions
+
+    def version(self):
+        return self._version
+
+    def transactions(self):
+        return SimpleNamespace(contains=self._transactions.__contains__, apply=self._transactions.__getitem__)
+
+
+class _DeltaWriter:
+    def __init__(self, saved):
+        self.saved = saved
+
+    def mode(self, *args):
+        return self
+
+    def option(self, *args):
+        return self
+
+    def save(self, path):
+        self.saved.append(path)
+
+
+def _append_with(monkeypatch, snapshots, committed):
+    """write_table's append with these snapshots (one per look); returns (receipt, saves, the versions looked from)."""
+    saved, looked = [], []
+    snapshots = iter(snapshots)
+    monkeypatch.setattr(delta, "_snapshot", lambda *args: next(snapshots))
+    monkeypatch.setattr(delta, "_find_commit", lambda *args: looked.append(args[4]) or committed)
+    monkeypatch.setattr(delta, "_writer", lambda *args: _DeltaWriter(saved))
+    monkeypatch.setattr(delta, "_register", lambda *args: None)
+    receipt = delta.write_table(_context(), None, {}, path="file:///table", defaults={})
+    return receipt, saved, looked
+
+
+def test_a_first_delta_append_reads_no_log_before_writing(monkeypatch):
+    receipt, saved, looked = _append_with(
+        monkeypatch, [_Snapshot(4, {}), _Snapshot(5, {"job:out:store-id": 7})], (5, {"numOutputRows": "2"}))
+    assert saved == ["file:///table"] and looked == [5]    # only the new commit is looked for, from the newest
+    assert (receipt.version, receipt.rows) == (5, 2)
+
+
+def test_a_replayed_delta_append_finds_its_transaction_in_the_snapshot(monkeypatch):
+    receipt, saved, looked = _append_with(monkeypatch, [_Snapshot(9, {"job:out:store-id": 7})], None)
+    assert saved == [] and looked == [9]
+    assert (receipt.version, receipt.rows) == (None, None)  # its commit has left the log: not written twice
 
 
 def test_registration_creates_what_the_catalog_lacks_with_validated_names():

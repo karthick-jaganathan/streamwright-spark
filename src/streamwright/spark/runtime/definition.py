@@ -20,6 +20,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+from streamwright.core.jobs.check.rules import install_hint
 from streamwright.core.sdk.contract import AdapterLoadError, ConnectorDefinition
 from streamwright.spark.io.capabilities import CAPABILITIES as READ_WRITE_CAPABILITIES
 from streamwright.spark.io.messaging import CAPABILITIES as MESSAGE_CAPABILITIES
@@ -49,7 +50,7 @@ class DefinedAdapter:
 
     @property
     def install_hint(self):
-        return "streamwright connectors install " + self.provider
+        return install_hint(self.provider)
 
     @property
     def holds_state(self):
@@ -98,10 +99,8 @@ def bind(definition, name):
     try:
         adapter = definition.load_adapter("spark")
     except (AdapterLoadError, ImportError, AttributeError, TypeError, ValueError) as exc:
-        extra = 'pip install "streamwright-%s[spark]"' % name.replace("_", "-")
         raise SparkAdapterLoadError(f"connector {name!r}: its Spark adapter cannot be loaded "
-                                    f"({type(exc).__name__}: {exc}); install the connector's Spark extra: {extra}"
-                                    ) from None
+                                    f"({type(exc).__name__}: {exc}); {install_hint(name)}") from None
     if isinstance(adapter, type):
         try:
             adapter = adapter()

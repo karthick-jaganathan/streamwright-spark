@@ -25,20 +25,25 @@ Configuration-derived JDBC host, database and port are checked again after resol
 A SparkJob reaches **every** connector (connector contract v1.2 §6a). A connector with a
 native Spark adapter runs distributed reads and writes; a source-only connector (the ads
 and HTTP connectors) runs as a **call step**: the driver executes it through the source
-engine (`SourceRunner.collect`) and then parallelizes its records into a DataFrame.
-The result is currently collected and JSON-serialized on the driver, so driver memory
-grows with the full result size; `page_size` sets Spark partitions and does not bound
-driver memory. A call step has the same shape as a DuckDBJob call step — a
-`connection`, then `service`/`method` with `arguments` (or an HTTP `request`) and an
-optional `sql` over `input`:
+engine (`SourceRunner.collect`) and then parallelizes its records into a DataFrame, `page_size`
+records at a time (default 5000; Python holds one chunk, but the parallelized chunks stay in the
+driver JVM until Spark reads them, so the result must still fit the driver's memory: at most
+`runtime.limits.call_records` records per step and batch). A call
+step has the same shape as a DuckDBJob call step — a `connection`, then
+`operation: {service, method, arguments}` (or an HTTP request `{path, ...}`) and an optional
+`sql` over `records`, one row per record with one `record` column, the record's JSON text
+(Spark SQL reads it with `get_json_object` or `from_json`); its columns do not depend on how
+many records came, so a batch that reads none still runs the `sql`. Without `sql` the step has
+the records' own (inferred) columns:
 
 ```yaml
 - name: raw_campaigns
   connection: google_ads_api        # provider: google_ads (source-only)
-  service: GoogleAdsService
-  method: search_stream
-  arguments: {customer_id: "123", query: "SELECT campaign.id FROM campaign"}
-  sql: SELECT * FROM input
+  operation:
+    service: GoogleAdsService
+    method: search_stream
+    arguments: {customer_id: "123", query: "SELECT campaign.id FROM campaign"}
+  sql: SELECT get_json_object(record, '$.campaign.id') AS campaign_id FROM records
 ```
 
 `sw connectors` shows this reach, e.g. `google_ads  [source, duckdb (call), spark (call)]`.
@@ -50,43 +55,85 @@ optional `sql` over `input`:
 ```yaml
 - name: accounts
   connection: api
-  request: {path: /v1/accounts, method: GET}
-  sql: SELECT id AS account_id FROM input
+  operation: {path: /v1/accounts, method: GET}
+  sql: SELECT get_json_object(record, '$.id') AS account_id FROM records
 - name: orders
   connection: api
   partitions: [{from: accounts, field: account_id}]
-  request: {path: "/v1/accounts/{{ partition.account_id }}/orders", method: GET}
-  retry: {codes: [429, 503], max_attempts: 5}
-  sql: SELECT * FROM input
+  operation: {path: "/v1/accounts/{{ partition.account_id }}/orders", method: GET}
+  policy:
+    retry: {codes: [429, 503], max_attempts: 5}
 ```
+
+## Apply outputs (writes to a vendor API)
+
+An output whose connection is a connector (no Spark adapter) and whose `operation:` is one of its apply
+operations - Google Ads `*Service.mutate_*`, `ConversionUploadService.upload_click_conversions`, ... - sends its rows
+to the vendor, one operation per row (`sql` gives the rows; they are collected on the driver, at most
+`runtime.limits.apply_rows`, default 100000). The shape, policies and delivery are DuckDBJob's, shared:
+`apply: {chunk_size, on_row_error: fail|continue, nulls: error|skip_field|clear, on_unknown: hold|reconcile,
+allow_remove}`, `policy: {retry, rate_limit}` and `log: {sql, message, level, max_rows}` (once the rows are sent, a
+line per row of a SELECT over the output's results: its columns and `outcome.status|error_code|error_message|result|row`);
+rows are committed to the outbox with the batch, each chunk is marked in flight
+before its call and every row's outcome kept (`sw spark state show JOB JOB_ID`). A call cut short is sent again for
+an idempotent operation, else held until `sw spark state resend|skip JOB JOB_ID` (MCP: `get_engine_guide("duckdb",
+"Apply outputs")` has the details).
 
 ## File names
 
-A file output (`service: object`, `method: write`) writes Spark's own `part-*` files into the folder `path`, unless a
+A file output (`operation: {service: object, method: write}`) writes Spark's own `part-*` files into the folder `path`, unless a
 `file_name` template names them: one file, or with `split_by` one file per split, under the folders of `layout`
 (templates of `streamwright.core.jobs.naming`: `{today:%Y%m%d}`, `{now}`, `{batch_id}`, `{seq}`, a split column):
 
 ```yaml
 - name: save_orders
   connection: lake
-  service: object
-  method: write
-  arguments: {path: exports/orders/, format: csv, mode: overwrite,
-              layout: "{today:%Y/%m}", file_name: "orders_{today:%Y%m%d}.csv"}
+  operation:
+    service: object
+    method: write
+    arguments: {path: exports/orders/, format: csv, mode: overwrite,
+                layout: "{today:%Y/%m}", file_name: "orders_{today:%Y%m%d}.csv"}
   sql: SELECT * FROM orders
 ```
 
+`mode: append` is replay-safe only for named files of the batch (`{batch_id}` in a name, or `{{ batch.id }}` in
+`path`): Spark's own `part-*` files get new names on every attempt, so a replayed batch would add its rows again;
+write them to a folder of the batch with `mode: overwrite` (`path: exports/orders/{{ batch.id }}/`).
+
+## Templates and limits
+
+Paths, file names and predicates (`replace_where`, `target_predicate`) render `{{ batch.id }}`, `{{ batch.ts }}`,
+`{{ batch.id_safe }}`, `{{ batch.seq }}` and `{{ driver.host }}`; `sql` is never templated: it takes the `:batch_id`,
+`:batch_ts` and `:driver_host` parameters (and `spec.config` names), and a `{{ }}` constant in it is an error. An
+adapter's own tokens (a JDBC `staging_table`'s `{{ uuid }}`, `{{ output.name }}`) are accepted only in the arguments
+of that adapter's outputs. `runtime.limits` takes DuckDBJob's keys with their meaning: `reference_values` (10000),
+`read_groups` (200), `events` (the rows of one publish output, 10000) and `apply_rows` (100000), plus
+two Spark-only keys: `max_files_per_batch` (2000, one file read) and `call_records` (1000000, the records one call
+step may collect on the driver per batch, over all its partition scopes; DuckDBJob streams a call step's records to
+its table in chunks and has no such cap). A call step that passes `call_records` fails as soon as it does, before
+reading on, naming the step and the count reached; any other key is an error naming the Spark engine.
+
 ## Execution policy
 
-Steps and outputs take the one execution-policy vocabulary (the same keys and defaults as
-a source stream and a DuckDBJob): `retry {max_attempts, backoff, max_delay, codes}`,
-`rate_limit {requests, per}`, `paginator` / `page_size` (call steps), `timeout`, and
-`on_error: fail | skip | warn`. A transient read or write retries through the one shared
+Steps and outputs take the one execution-policy vocabulary in their `policy:` group (the same
+keys and defaults as a source stream's `policy:` and a DuckDBJob's): `retry {max_attempts,
+backoff, max_delay, codes}`, `rate_limit {requests, per}`, `page_size` (call steps; an HTTP
+step's `paginator` is in its `operation:`), `timeout`, and `on_error: fail | skip | warn`. A transient read or write retries through the one shared
 retry; `on_error` `skip`/`warn` tolerate a failed step or output (`fail` is the default).
 A key the Spark engine does not honour on a surface is an `unsupported-argument` error
 naming the engine (for example `rate_limit` on an output).
 Setting `checkpoint: true` on a step requires `runtime.spark.conf.spark.checkpoint.dir`; use a directory accessible
-to the Spark cluster.
+to the Spark cluster. With `persist` as well, the step is persisted, then checkpointed.
+
+## Logging a step's rows
+
+Any step may take DuckDBJob's `log: {message, level, max_rows}` with its meaning: each batch, one
+`step NAME: MESSAGE` line per row of the step (`{column}` placeholders, a dotted `{a.b}` is one column, NULL as `null`; `level` `debug | info |
+warning`, default `info`; `max_rows` 1..1000, default 20) on the `streamwright.steps` logger, then
+`step NAME: ... and N more row(s)`; nothing for zero rows. Lines are redacted and cut to 1000 characters; a
+placeholder the step's columns lack fails the step. Cost: the driver collects `limit(max_rows + 1)` (a Spark action)
+and, only when that returns more than `max_rows`, runs `count()` (a second action); each computes the step again
+unless it is persisted, so add `persist` to a costly step you log.
 
 ## Lookups and accounts
 

@@ -76,6 +76,14 @@ def test_append_name_with_batch_id_uses_core_template_metadata():
     )
 
 
+def test_append_of_part_files_is_refused_even_in_a_batch_folder():
+    # a replay would add new part-* files beside the first attempt's: overwrite the batch's folder instead
+    problems = check_write({"path": "output/{{ batch.id }}/", "format": "csv", "mode": "append"})
+    assert len(problems) == 1 and "mode overwrite" in problems[0]
+    assert check_write({"path": "output/{{ batch.id }}/", "format": "csv", "mode": "overwrite"}) == []
+    assert check_write({"path": "output/{{ batch.id }}/", "mode": "append", "file_name": "o_{today}.csv"}) == []
+
+
 def test_registry_loads_only_definitions_after_authorization():
     loaded = []
 
@@ -106,10 +114,10 @@ def test_registry_rejects_non_definition_connector():
             return object()
 
     registry = Registry(entry_points=lambda: {"streamwright.connectors": [Entry()]})
-    with pytest.raises(RegistryError, match="old \\(unknown distribution\\) targets the pre-contract connector API"):
+    with pytest.raises(RegistryError, match="old \\(unknown distribution\\) is not a ConnectorDefinition"):
         registry.load("old")
     _, problems = registry.load_all()
-    assert len(problems) == 1 and "old (unknown distribution) targets the pre-contract connector API" in problems[0]
+    assert len(problems) == 1 and "old (unknown distribution) is not a ConnectorDefinition" in problems[0]
     with pytest.raises(RegistryError, match="ConnectorDefinition"):
         registry.register(object())
 
@@ -157,9 +165,7 @@ def test_spark_rules_restrict_secret_placement_and_warn_non_idempotent(definitio
                 "name": "result",
                 "sql": "SELECT * FROM rows",
                 "connection": "sink",
-                "service": "data",
-                "method": "put",
-                "arguments": {},
+                "operation": {"service": "data", "method": "put", "arguments": {}},
             }
         ],
         "runtime": {"state": {"sqlite": ":memory:"}, "spark": {}, "platform": {"type": "local"}},
@@ -179,8 +185,8 @@ def test_spark_cli_validates_job_through_public_report(monkeypatch, tmp_path, ca
     job.write_text(
         "kind: SparkJob\nname: sample\nconnections:\n  sink:\n    provider: fake\n"
         "steps:\n  - name: rows\n    sql: SELECT 1\noutputs:\n"
-        "  - name: result\n    connection: sink\n    service: data\n    method: put\n"
-        "    arguments: {}\n    sql: SELECT * FROM rows\nruntime:\n"
+        "  - name: result\n    connection: sink\n    operation: {service: data, method: put, arguments: {}}\n"
+        "    sql: SELECT * FROM rows\nruntime:\n"
         "  state:\n    sqlite: ':memory:'\n  spark: {}\n  platform:\n    type: local\n",
         encoding="utf-8",
     )

@@ -21,6 +21,7 @@ import contextlib
 import dataclasses
 
 from streamwright.core.cli.jobs import JOB_HELP
+from streamwright.core.jobs.grammar import to_internal
 from streamwright.core.jobs.inputs import InputError, parse_set, read_config_values
 from streamwright.spark.cli.common import err
 from streamwright.spark.job import validate as validate_job
@@ -67,8 +68,8 @@ def run(args):
             if provider and provider not in adapters:
                 with contextlib.suppress(RegistryError):
                     adapters[provider] = registry.load(provider, allow=args.allow_connector)
-        if report.valid and (args.analyze or args.graph):
-            plan = build_plan(job, adapters)
+        plan = build_plan(to_internal(job), adapters) if report.valid and (args.analyze or args.graph) else None
+        if plan is not None:            # the engines' internal shape (core jobs.grammar): what a run executes
             if args.analyze:
                 print(plan.describe())
             if args.graph:
@@ -76,8 +77,8 @@ def run(args):
                     print("%-8s %-22s <- %s" % (node.kind, node.name, ", ".join(node.uses) or "-"))
         for issue in report.issues:
             err(str(issue if issue.file else dataclasses.replace(issue, file=path)))
-        if report.valid and args.analyze:
-            for warning in build_plan(job, adapters).warnings:
+        if plan is not None and args.analyze:
+            for warning in plan.warnings:
                 err("%s: warning: %s" % (path, warning))
         if not report.valid:
             code = 2

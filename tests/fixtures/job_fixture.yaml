@@ -134,20 +134,22 @@ steps:
   # ============================================================================
   - name: client_columns
     connection: config_db
-    service: database
-    method: query
-    arguments:
-      query: "SELECT prefix, header, canonical, type, required FROM ingest.column_mappings WHERE dataset = 'orders' AND active"
+    operation:
+      service: database
+      method: query
+      arguments:
+        query: "SELECT prefix, header, canonical, type, required FROM ingest.column_mappings WHERE dataset = 'orders' AND active"
 
   # ============================================================================
   # STEP 2: Query canonical target schema vocabulary
   # ============================================================================
   - name: canonical_columns
     connection: config_db
-    service: database
-    method: query
-    arguments:
-      query: "SELECT name, type FROM ingest.canonical_columns WHERE dataset = 'orders'"
+    operation:
+      service: database
+      method: query
+      arguments:
+        query: "SELECT name, type FROM ingest.canonical_columns WHERE dataset = 'orders'"
 
   # ============================================================================
   # STEP 3: Consume file arrival announcements from Kafka
@@ -155,15 +157,16 @@ steps:
   # ============================================================================
   - name: arrivals
     connection: bus
-    service: message
-    method: consume
-    arguments:
-      destination: lake.file_arrived.v1
-      group_id: streamwright-bronze-client-orders
-      options:
-        auto.offset.reset: earliest
-        max.poll.records: 500
-      max_wait: 30s
+    operation:
+      service: message
+      method: consume
+      arguments:
+        destination: lake.file_arrived.v1
+        group_id: streamwright-bronze-client-orders
+        options:
+          auto.offset.reset: earliest
+          max.poll.records: 500
+        max_wait: 30s
     sql: |
       SELECT
         p.message_id,
@@ -199,16 +202,17 @@ steps:
   # ============================================================================
   - name: orders
     connection: landing
-    service: object
-    method: read
-    arguments:
-      path: "{{ valid_arrivals.file_uri }}"
-      format: csv
-      options:
-        header: true
-      columns: "{{ client_columns }}"
-      vocabulary: "{{ canonical_columns }}"
-      on_mismatch: skip
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ valid_arrivals.file_uri }}"
+        format: csv
+        options:
+          header: true
+        columns: "{{ client_columns }}"
+        vocabulary: "{{ canonical_columns }}"
+        on_mismatch: skip
 
   # ============================================================================
   # STEP 6: Tag orders with batch metadata & partition date
@@ -236,20 +240,21 @@ outputs:
   # ============================================================================
   - name: bronze_orders
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3://{{ config.lake_bucket }}/bronze/orders"
-      partition_by: [event_date]
-      condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
-      target_predicate: "target.event_date IN ({{ tagged_orders.event_date }})"
-      when_matched:
-        - action: update
-          set:
-            event_date: source.event_date
-            _batch_id: source._batch_id
-      when_not_matched: [{action: insert}]
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3://{{ config.lake_bucket }}/bronze/orders"
+        partition_by: [event_date]
+        condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
+        target_predicate: "target.event_date IN ({{ tagged_orders.event_date }})"
+        when_matched:
+          - action: update
+            set:
+              event_date: source.event_date
+              _batch_id: source._batch_id
+        when_not_matched: [{action: insert}]
     sql: "SELECT * FROM tagged_orders"
 
   # ============================================================================
@@ -258,10 +263,11 @@ outputs:
   # ============================================================================
   - name: bronze_rejects
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      path: "s3://{{ config.lake_bucket }}/bronze/rejects"
+    operation:
+      service: table
+      method: write
+      arguments:
+        path: "s3://{{ config.lake_bucket }}/bronze/rejects"
     sql: |
       SELECT message_id, file_uri AS path, _error AS reason, :batch_id AS batch_id
       FROM arrivals
@@ -277,19 +283,20 @@ outputs:
   # ============================================================================
   - name: client_exports
     connection: lake
-    service: object
-    method: write
-    arguments:
-      path: "s3://{{ config.lake_bucket }}/exports/orders/"
-      format: csv
-      mode: overwrite
-      options:
-        header: true
-        compression: gzip
-      split_by: [client_id, event_date]
-      layout: "{client_id}/dt={event_date:%Y-%m-%d}"
-      file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
-      max_splits: 500
+    operation:
+      service: object
+      method: write
+      arguments:
+        path: "s3://{{ config.lake_bucket }}/exports/orders/"
+        format: csv
+        mode: overwrite
+        options:
+          header: true
+          compression: gzip
+        split_by: [client_id, event_date]
+        layout: "{client_id}/dt={event_date:%Y-%m-%d}"
+        file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
+        max_splits: 500
     sql: "SELECT client_id, event_date, event_ts, amo_id, revenue FROM tagged_orders"
 
   # ============================================================================
@@ -297,14 +304,15 @@ outputs:
   # ============================================================================
   - name: ingest_audit
     connection: reporting_db
-    service: database
-    method: write
-    arguments:
-      mode: merge
-      table: reporting.ingest_audit
-      primary_key: [batch_id, client_id]
-      update: [row_count, revenue]
-      staging_table: reporting.ingest_audit_stg
+    operation:
+      service: database
+      method: write
+      arguments:
+        mode: merge
+        table: reporting.ingest_audit
+        primary_key: [batch_id, client_id]
+        update: [row_count, revenue]
+        staging_table: reporting.ingest_audit_stg
     sql: |
       SELECT
         :batch_id AS batch_id,
@@ -321,11 +329,12 @@ outputs:
   # ============================================================================
   - name: announce
     connection: bus
-    service: message
-    method: publish
-    arguments:
-      destination: lake.bronze.committed.v1
-      key: table_name
+    operation:
+      service: message
+      method: publish
+      arguments:
+        destination: lake.bronze.committed.v1
+        key: table_name
     sql: "SELECT table_name, version, rows, batch_id FROM _commits WHERE output = 'bronze_orders'"
 
 runtime:

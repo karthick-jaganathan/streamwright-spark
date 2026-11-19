@@ -32,12 +32,14 @@ roots and Hadoop URL), so Spark reads the table with the storage's credentials a
   catalog when it is not there yet.
 """
 
+import itertools
 import json
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final
 
 from delta.tables import DeltaTable
+from py4j.protocol import Py4JError
 from pyspark.sql import DataFrame, functions
 from pyspark.sql import Observation as SparkObservation
 
@@ -143,20 +145,39 @@ def _read_log(context: SparkContext, log: Any, filesystem: Any, app_id: str, tra
     return found, metrics
 
 
-def _find_commit(context: SparkContext, path: str, app_id: str, transaction: int) -> Any:
-    """(version, metrics) of the commit holding the application transaction, or None (not history(1)'s latest)."""
-    log_path, filesystem = context.runtime._fs(path.rstrip("/") + "/_delta_log")
-    if not filesystem.exists(log_path):
+def _snapshot(context: SparkContext, path: str) -> Any:
+    """The table's current snapshot (delta-spark's DeltaLog), or None where this delta-spark has no such API."""
+    jvm = context.spark._jvm
+    try:
+        log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(context.spark._jsparkSession, path)
+        return log.update(False, jvm.scala.Option.empty())
+    except Py4JError:
         return None
-    logs = sorted(
-        (
-            status.getPath()
-            for status in filesystem.listStatus(log_path)
-            if str(status.getPath().getName()).endswith(".json")
-        ),
-        key=lambda item: str(item.getName()),
-        reverse=True,
-    )
+
+
+def _applied(snapshot: Any, app_id: str) -> int | None:
+    """The last txnVersion the snapshot holds for `app_id` (its SetTransaction), or None."""
+    transactions = snapshot.transactions()
+    return int(transactions.apply(app_id)) if transactions.contains(app_id) else None
+
+
+def _log_files(context: SparkContext, path: str, latest: int | None) -> Any:
+    """(filesystem, the JSON commit files newest first): from version `latest` down, or (None) all the log lists."""
+    log_path, filesystem = context.runtime._fs(path.rstrip("/") + "/_delta_log")
+    if latest is not None:
+        files = (log_path.suffix("/%020d.json" % version) for version in range(latest, -1, -1))
+        return filesystem, itertools.takewhile(filesystem.exists, files)   # cleaned-up commits end the log
+    if not filesystem.exists(log_path):
+        return filesystem, iter(())
+    return filesystem, iter(sorted(
+        (status.getPath() for status in filesystem.listStatus(log_path)
+         if str(status.getPath().getName()).endswith(".json")),
+        key=lambda item: str(item.getName()), reverse=True))
+
+
+def _find_commit(context: SparkContext, path: str, app_id: str, transaction: int, latest: int | None = None) -> Any:
+    """(version, metrics) of the commit holding the application transaction (newest first), or None."""
+    filesystem, logs = _log_files(context, path, latest)
     for log in logs:
         found, metrics = _read_log(context, log, filesystem, app_id, transaction)
         if found:
@@ -164,7 +185,7 @@ def _find_commit(context: SparkContext, path: str, app_id: str, transaction: int
     return None
 
 
-def _commit_receipt(name: str, path: str, committed: tuple[int, Mapping[str, Any]]) -> WriteReceipt:
+def _commit_receipt(name: str, path: str, committed: tuple[int | None, Mapping[str, Any]]) -> WriteReceipt:
     version, metrics = committed
     rows = int(metrics["numOutputRows"]) if metrics.get("numOutputRows") is not None else None
     return WriteReceipt(name, path, rows, version=version, observations=[Observation(name, {"rows": rows})])
@@ -172,14 +193,27 @@ def _commit_receipt(name: str, path: str, committed: tuple[int, Mapping[str, Any
 
 def _append(context: SparkContext, frame: DataFrame, arguments: Mapping[str, Any], path: str,
             options: Mapping[str, Any]) -> WriteReceipt:
+    """
+    An append once per batch: the snapshot's SetTransaction says whether this batch's transaction is in the table
+    (no log scan); its commit is then read newest first for the receipt (the whole log only without that API).
+    """
     batch = context.runtime.ctx
     app_id = batch.transaction_app_id(context.name)
     transaction = batch.batch_sequence
-    committed = _find_commit(context, path, app_id, transaction)
+    snapshot = _snapshot(context, path)
+    if snapshot is None:
+        committed = _find_commit(context, path, app_id, transaction)
+    else:
+        applied = _applied(snapshot, app_id)
+        committed = None if applied is None or applied < transaction else (
+            _find_commit(context, path, app_id, transaction, int(snapshot.version()))
+            or (None, {}))              # its commit has left the log (log retention): committed, version unknown
     if committed is None:
         _writer(frame, arguments, options).mode("append").option("txnAppId", app_id).option(
             "txnVersion", transaction).save(path)
-        committed = _find_commit(context, path, app_id, transaction)
+        snapshot = _snapshot(context, path)
+        committed = _find_commit(context, path, app_id, transaction,
+                                 None if snapshot is None else int(snapshot.version()))
         if committed is None:
             raise RuntimeError("the Delta append transaction was not found in the transaction log")
     return _commit_receipt(context.name, path, committed)

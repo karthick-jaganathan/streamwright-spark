@@ -21,6 +21,7 @@ import unittest
 from types import MappingProxyType
 
 from streamwright.connectors.kafka import CONNECTOR
+from streamwright.core.jobs.grammar import to_internal
 from streamwright.spark.job import load_job
 from streamwright.spark.plan import build_plan as _build_plan
 from streamwright.spark.runtime.definition import DefinedAdapter
@@ -37,7 +38,7 @@ EXAMPLE = os.path.join(os.path.dirname(__file__), "fixtures", "job_fixture.yaml"
 
 class Plan(unittest.TestCase):
     def setUp(self):
-        self.job = load_job(EXAMPLE)
+        self.job = to_internal(load_job(EXAMPLE))  # the plan reads the engine's internal shape
 
     def test_example_has_no_warnings(self):
         self.assertEqual(build_plan(self.job).warnings, [])

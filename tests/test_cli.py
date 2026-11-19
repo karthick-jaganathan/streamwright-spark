@@ -24,6 +24,7 @@ import pytest
 from streamwright.core.runtime import logs
 from streamwright.core.runtime.logs.lines import utc_now
 from streamwright.spark.cli import main
+from streamwright.spark.cli import run as run_module
 from streamwright.spark.cli.run import _preview_dry_run, _spark_conf, _submit
 from streamwright.spark.cli.run_options import check_options as _check_options
 from streamwright.spark.cli.run_options import driver_flags as _driver_flags
@@ -184,18 +185,9 @@ def test_options_that_do_not_apply_to_the_run_are_refused():
         "--conf spark.master: the launcher sets it"]
 
 
-def test_apply_state_migrations_is_forwarded_and_no_init_state_is_gone(capsys):
+def test_apply_state_migrations_is_forwarded():
     assert "--apply-state-migrations" in _driver_flags(arguments(interval=None, apply_state_migrations=True))
     assert "--apply-state-migrations" not in _driver_flags(arguments(interval=None))
-    with pytest.raises(SystemExit) as usage:
-        main(["run", "job.yaml", "--no-init-state"])
-    assert usage.value.code == 2 and "--apply-state-migrations makes it" in capsys.readouterr().err
-
-
-def test_the_old_run_key_option_is_reported_as_renamed(capsys):
-    with pytest.raises(SystemExit) as usage:
-        main(["run", "job.yaml", "--run-key", "k"])
-    assert usage.value.code == 2 and "--run-key was renamed --job-key" in capsys.readouterr().err
 
 
 def test_lock_needs_a_spark_version_to_write_and_well_formed_jars(capsys):
@@ -246,3 +238,36 @@ def test_a_lock_check_finds_what_the_job_needs_now():
         "the job now needs jar a:b:2, which the lock does not pin",
         "the lock pins jar a:b:1, which the job no longer needs"]
     assert lockmod.lock_drift(old, old) == []
+
+
+def test_a_run_leases_for_runtime_state_ttl_seconds(monkeypatch, tmp_path):
+    captured = {}
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, *args):
+            return 0
+
+    session = SimpleNamespace(build_session=lambda *args, **kwargs: None,
+                              resolve_spark_metadata=lambda spark: ("app", "driver"))
+    executor = SimpleNamespace(SparkExecutor=None)
+    monkeypatch.setattr(run_module, "import_module", lambda name: session if name.endswith(".session") else executor)
+    monkeypatch.setattr(run_module, "Runner", Runner)
+    monkeypatch.setattr(run_module, "connections_of", lambda *args, **kwargs: {})
+    monkeypatch.setattr(run_module, "open_store", lambda *args: SimpleNamespace(prepare=lambda migrate: None))
+    monkeypatch.setattr(run_module, "_configure_driver_conf", lambda *args: None)
+    monkeypatch.setattr(run_module, "_broker_calls", lambda *args: (None, []))
+    job = {"kind": "SparkJob", "name": "j", "connections": {}, "steps": [], "outputs": [],
+           "runtime": {"state": {"sqlite": str(tmp_path / "state.db"), "ttl_seconds": 45},
+                       "platform": {"type": "local"}}}
+    args = arguments(job=str(tmp_path / "job.yaml"), interval=None)
+    assert run_module._drive_one(job, {}, args, {}, {}, lock=None, outcome={}) == 0
+    assert captured["lease_seconds"] == 45
+
+
+def test_validate_analyze_plans_the_jobs_internal_shape(capsys):
+    assert main(["validate", "--analyze", "examples/s3/partner_orders.yaml"]) == 0
+    actions = [line for line in capsys.readouterr().out.splitlines() if line.startswith("  ")]
+    assert len(actions) == 6 and any("driver reads" in line for line in actions)   # operation: read as flat keys

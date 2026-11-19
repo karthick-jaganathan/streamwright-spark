@@ -18,16 +18,23 @@
 """SparkJob source-connector call steps (contract v1.2 §6a engine reach) and execution policy, with a fake source."""
 
 import dataclasses
+import importlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from streamwright.core.jobs import Runner, WriteReceipt, calls
+from streamwright.core.jobs.apply.delivery import Applier, apply_calls
+from streamwright.core.jobs.grammar import to_internal
 from streamwright.core.jobs.policy import TransientError
 from streamwright.core.jobs.state import open_sqlite
 from streamwright.core.runtime import components
+from streamwright.core.runtime.redact import Redactor
+from streamwright.core.sdk.apply import RowResult
 from streamwright.core.sdk.contract import ConnectorDefinition, Field, Operation, OperationKind
 from streamwright.spark.cli.common import connections_of
+from streamwright.spark.cli.run import apply_connectors
 from streamwright.spark.contracts import Connection
 from streamwright.spark.engine.executor import SparkExecutor
 from streamwright.spark.job import validate
@@ -92,8 +99,15 @@ class FakeReader:
 
 
 class FakeContext:
+    def __init__(self):
+        self.chunks = []
+
     def parallelize(self, lines, slices):
+        self.chunks.append(list(lines))
         return list(lines)
+
+    def union(self, chunks):
+        return [line for chunk in chunks for line in chunk]
 
 
 class FakeSpark:
@@ -118,11 +132,13 @@ def _job():
         "kind": "SparkJob", "name": "ads",
         "connections": _declared(),
         "spec": {"secrets": {"tok": {"type": "string"}}},
-        "steps": [{"name": "rows", "connection": "src", "service": "data", "method": "list",
-                   "arguments": {"query": "SELECT 1"}, "retry": {"max_attempts": 3}, "rate_limit": {"requests": 2,
-                   "per": "1s"}, "on_error": "skip", "timeout": "30s", "page_size": 1}],
-        "outputs": [{"name": "out", "connection": "lake", "service": "object", "method": "write",
-                     "arguments": {"path": "out/", "format": "parquet", "mode": "overwrite"},
+        "steps": [{"name": "rows", "connection": "src",
+                   "operation": {"service": "data", "method": "list", "arguments": {"query": "SELECT 1"}},
+                   "policy": {"retry": {"max_attempts": 3}, "rate_limit": {"requests": 2, "per": "1s"},
+                              "on_error": "skip", "timeout": "30s", "page_size": 1}}],
+        "outputs": [{"name": "out", "connection": "lake",
+                     "operation": {"service": "object", "method": "write",
+                                   "arguments": {"path": "out/", "format": "parquet", "mode": "overwrite"}},
                      "sql": "SELECT * FROM rows"}],
         "runtime": {"state": {"sqlite": "state.db"}, "platform": {"type": "local"}},
     }
@@ -145,11 +161,49 @@ def test_a_source_call_step_loads_its_records_into_a_dataframe(fakesrc):
     # a provider without a Spark adapter is no native connection: the step runs as a call step
     connections = connections_of(_job(), adapters={}, secrets={"tok": "secret-value"})
     assert connections == {}
-    executor = SparkExecutor(FakeSpark(), {"name": "ads", "steps": [], "outputs": []}, connections, {},
+    spark = FakeSpark()
+    executor = SparkExecutor(spark, {"name": "ads", "steps": [], "outputs": []}, connections, {},
                              config={}, limits={}, declared_connections=_declared(),
                              secrets={"tok": "secret-value"})
-    frame = executor._step(None, _job()["steps"][0])
+    frame = executor._step(None, to_internal(_job())["steps"][0])
     assert [json.loads(line) for line in frame.lines] == list(RECORDS)
+    assert [len(chunk) for chunk in spark.sparkContext.chunks] == [1, 1]   # loaded page_size records at a time
+
+
+class PagedSession(FakeSession):
+    pages = 0
+
+    def read(self, operation, arguments, context):
+        for page in range(100):
+            PagedSession.pages += 1
+            yield [{"id": page * 100 + index} for index in range(100)]
+
+
+class PagedSourceAdapter(FakeSourceAdapter):
+    def open(self, connection, context):
+        return PagedSession()
+
+
+@pytest.mark.parametrize(("cap", "pages"), [(150, range(2, 5)), (10_000, [100])], ids=["over", "under"])
+def test_a_call_step_stops_collecting_once_past_runtime_limits_call_records(cap, pages):
+    components.register(dataclasses.replace(CONNECTOR, adapters={"source": "tests.test_call_steps:PagedSourceAdapter"}))
+    session = importlib.import_module("tests.test_call_steps").PagedSession   # the class the connector loads
+    session.pages = 0
+    try:
+        executor = SparkExecutor(FakeSpark(), {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={},
+                                 limits={"call_records": cap}, declared_connections=_declared(),
+                                 secrets={"tok": "secret-value"})
+        step = to_internal(_job())["steps"][0]
+        if cap < 10_000:
+            with pytest.raises(ValueError, match=r"call step rows reached 151 records, more than "
+                                                 r"runtime\.limits\.call_records \(150\)"):
+                executor._step(None, step)
+        else:
+            assert len(executor._step(None, step).lines) == 10_000
+    finally:
+        components.unregister("fakesrc")
+    # over the limit: the page that passed it, and at most the source runner's bounded read-ahead (64 records)
+    assert session.pages in pages
 
 
 def test_an_output_write_retries_a_transient_error(tmp_path, definition_adapter):
@@ -198,8 +252,8 @@ class FakeRuntime:
 
 
 def _partitioned_step(connection="src"):
-    return {"name": "ad_groups", "connection": connection, "service": "data", "method": "list",
-            "arguments": {"query": "{{ partition.campaign_id }}"},
+    return {"name": "ad_groups", "connection": connection,
+            "operation": {"service": "data", "method": "list", "arguments": {"query": "{{ partition.campaign_id }}"}},
             "partitions": [{"from": "campaigns", "field": "id", "name": "campaign_id"}]}
 
 
@@ -207,7 +261,7 @@ def test_a_call_step_runs_once_per_partition_value_of_an_earlier_step(fakeecho):
     declared = {"echo": {"provider": "fakeecho", "token": "{{ secrets.tok }}"}}
     executor = SparkExecutor(FakeSpark(), {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={},
                              limits={}, declared_connections=declared, secrets={"tok": "secret-value"})
-    frame = executor._step(FakeRuntime(), _partitioned_step("echo"))
+    frame = executor._step(FakeRuntime(), to_internal({"steps": [_partitioned_step("echo")]})["steps"][0])
     assert [json.loads(line) for line in frame.lines] == [{"campaign": "c10"}, {"campaign": "c20"}]
 
 
@@ -228,7 +282,7 @@ def test_a_spark_adapter_that_cannot_load_names_the_cause_and_the_extra():
     with pytest.raises(registry.SparkAdapterLoadError) as caught:
         bind(broken, "fakesrc")
     assert "ModuleNotFoundError" in str(caught.value)
-    assert 'pip install "streamwright-fakesrc[spark]"' in str(caught.value)
+    assert "streamwright connectors install fakesrc" in str(caught.value)
 
 
 def test_validation_reports_an_adapter_that_cannot_load_even_for_a_source_connector(fakesrc, monkeypatch):
@@ -237,3 +291,148 @@ def test_validation_reports_an_adapter_that_cannot_load_even_for_a_source_connec
     monkeypatch.setattr(registry.Registry, "load", load)
     report = validate(_job())
     assert not report.valid and any("cannot be loaded" in str(issue) for issue in report.issues)
+
+
+class LedgerSession:
+    def apply(self, operation, arguments, rows, context):
+        return [RowResult.applied({"id": "%s/e-%s/%d" % (arguments["account"], row["key"], len(rows))})
+                for row in rows]
+
+
+class LedgerAdapter:
+    def open(self, connection, context):
+        assert connection["token"] == "secret-value"      # rendered from the declared secret reference
+        return LedgerSession()
+
+
+LEDGER_API = ConnectorDefinition(
+    name="ledger_api", title="Ledger API", family="test",
+    connection=(Field("token", "string", required=True, secret=True),),
+    operations=(Operation(service="entries", method="mutate", kind=OperationKind.APPLY, max_chunk=2,
+                          actions=("create",), arguments=(Field("account", "string", required=True),)),),
+    adapters={"source": "tests.test_call_steps:LedgerAdapter"})
+
+
+class RowsFrame(FakeFrame):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def limit(self, count):
+        return RowsFrame(self.rows[:count])
+
+    def collect(self):
+        return [dataclasses.make_dataclass("Row", ["values"])(row) for row in self.rows]
+
+
+class RowsSpark(FakeSpark):
+    def sql(self, text, args=None):
+        return RowsFrame([{"key": key} for key in range(3)])
+
+
+def _apply_job():
+    return {"kind": "SparkJob", "name": "push",
+            "connections": {"ledger": {"provider": "ledger_api", "token": "{{ secrets.tok }}"}},
+            "spec": {"secrets": {"tok": {"type": "string"}}},
+            "steps": [{"name": "rows", "sql": "SELECT 1 AS key"}],
+            "outputs": [{"name": "push", "connection": "ledger",
+                         "operation": {"service": "entries", "method": "mutate", "arguments": {"account": "acc-1"}},
+                         "sql": "SELECT key FROM rows", "apply": {"chunk_size": 2}}],
+            "runtime": {"state": {"sqlite": "state.db"}, "platform": {"type": "local"}}}
+
+
+@pytest.fixture
+def ledger_api(monkeypatch):
+    monkeypatch.setattr(RowsFrame, "collect", lambda self: [
+        type("Row", (), {"asDict": lambda _, recursive=False, row=row: row})() for row in self.rows])
+    components.register(LEDGER_API)
+    yield
+    components.unregister("ledger_api")
+
+
+def test_an_adapter_write_output_is_not_taken_for_an_apply_output(ledger_api):
+    # a connector with a Spark adapter writes through it (`database.write`); only adapter-less connectors apply rows
+    job = _apply_job()
+    job["connections"]["pg"] = {"provider": "postgres", "host": "db", "dbname": "shop"}
+    job["outputs"].append({"name": "audit", "connection": "pg", "sql": "SELECT key FROM rows",
+                           "operation": {"service": "database", "method": "write",
+                                         "arguments": {"mode": "append", "table": "audit"}}})
+    job = to_internal(job)
+    found = apply_calls(job, job["connections"], apply_connectors({"postgres": object()}))
+    assert set(found) == {"push"}
+
+
+def test_a_spark_apply_output_validates_and_its_rows_are_applied_through_the_shared_outbox(tmp_path, ledger_api):
+    job = _apply_job()
+    report = validate(job)
+    assert report.valid, [str(i) for i in report.issues if i.severity == "error"]
+    assert not validate(dict(job, outputs=[dict(job["outputs"][0], apply={"chunk_size": 5})])).valid
+    job = to_internal(job)                                  # what `sw spark run` hands the engine
+
+    store = open_sqlite(str(tmp_path / "spark.db"))
+    store.initialize()
+    applier = Applier(apply_calls(job, job["connections"], {"ledger_api"}), config={},
+                      secrets={"tok": "secret-value"}, redact=Redactor(["secret-value"]))
+    executor = SparkExecutor(RowsSpark(), job, {}, {}, config={}, limits={}, state=store,
+                             apply_outputs=applier.calls)
+    runner = Runner("push", store, executor, engine_metadata={"driver_host": "d"}, applier=applier)
+    assert runner.run() == 0, runner.error
+    outbox = store.list_events("push", runner.processed[0])
+    assert [(row["status"], row["result"]["id"]) for row in outbox] == [
+        ("applied", "acc-1/e-0/2"), ("applied", "acc-1/e-1/2"), ("applied", "acc-1/e-2/1")]     # chunks of 2
+    assert applier.counts == {"push": {"applied": 3, "failed": 0}}
+
+
+@pytest.fixture(scope="module")
+def spark():
+    sql = pytest.importorskip("pyspark.sql")
+    session = (sql.SparkSession.builder.master("local[1]").appName("test_call_steps")
+               .config("spark.ui.enabled", "false").getOrCreate())
+    yield session
+    session.stop()
+
+
+@pytest.mark.parametrize("records", [RECORDS, ()], ids=["records", "none"])
+def test_a_call_steps_sql_reads_records_as_json_text_like_duckdb(spark, monkeypatch, records):
+    monkeypatch.setattr(calls, "call_records", lambda *args, **kwargs: (
+        iter(records), SimpleNamespace(partial=False, state=None)))
+    executor = SparkExecutor(spark, {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={}, limits={},
+                             declared_connections=_declared(), secrets={"tok": "secret-value"})
+    executor.params = {}
+    step = dict(to_internal(_job())["steps"][0],
+                sql="SELECT get_json_object(record, '$.id') AS account_id FROM records")
+    frame = executor._step(None, step)
+    assert frame.columns == ["account_id"]          # also with no records: the step's columns do not depend on them
+    assert sorted(row.account_id for row in frame.collect()) == [str(record["id"]) for record in records]
+
+
+def test_persist_and_checkpoint_on_one_step_do_both(monkeypatch):
+    calls = []
+
+    class Tracked(FakeFrame):
+        def persist(self, level):
+            calls.append("persist")
+            return self
+
+        def checkpoint(self, eager):
+            calls.append("checkpoint")
+            return self
+
+    monkeypatch.setattr(FakeSpark, "sql", lambda self, text, args=None: Tracked())
+    job = {"name": "j", "steps": [{"name": "s", "sql": "SELECT 1", "persist": "memory", "checkpoint": True}],
+           "outputs": []}
+    executor = SparkExecutor(FakeSpark(), job, {}, {}, config={}, limits={})
+    executor.params = {}
+    executor._run_steps(None, [])
+    assert calls == ["persist", "checkpoint"]
+
+
+def test_event_outputs_are_capped_by_runtime_limits_events(ledger_api):
+    output = {"name": "announce", "sql": "SELECT key FROM rows"}
+    executor = SparkExecutor(RowsSpark(), {"name": "j", "steps": [], "outputs": []}, {}, {}, config={},
+                             limits={"events": 2, "reference_values": 5})
+    executor.params = {}
+    with pytest.raises(ValueError, match=r"more than 2 rows \(runtime\.limits\.events\)"):
+        executor._publish(None, [output])
+    executor.limits = {"events": 3, "reference_values": 1}
+    assert len(executor._publish(None, [output])["announce"]) == 3

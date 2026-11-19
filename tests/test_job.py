@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from streamwright.core.jobs.check import check_job as check_shared
+from streamwright.core.jobs.duckdb.engine import validate_job as validate_duckdb_job
 from streamwright.core.jobs.manifest import MAX_MANIFEST_BYTES, JobError, load_job_text
 from streamwright.core.sdk.contract import Field, Operation, OperationKind
 from streamwright.spark.job import load_job, resolve
@@ -43,9 +44,7 @@ def sample_job():
                 "name": "result",
                 "sql": "SELECT * FROM rows",
                 "connection": "db",
-                "service": "database",
-                "method": "put",
-                "arguments": {},
+                "operation": {"service": "database", "method": "put", "arguments": {}},
             }
         ],
         "runtime": {"state": {"sqlite": ":memory:"}, "spark": {"conf": {}}, "platform": {"type": "local"}},
@@ -65,9 +64,9 @@ def issues(job, definition_adapter):
 def test_spark_rules_accept_valid_job_and_reject_misplaced_secret(definition_adapter):
     job = sample_job()
     assert issues(job, definition_adapter) == []
-    job["outputs"][0]["arguments"]["path"] = "{{ secrets.key }}"
+    job["outputs"][0]["operation"]["arguments"]["path"] = "{{ secrets.key }}"
     assert any(issue.code == "secret-placement" for issue in issues(job, definition_adapter))
-    job["outputs"][0]["arguments"].clear()
+    job["outputs"][0]["operation"]["arguments"].clear()
     job["connections"]["db"]["password"] = "literal-password"
     assert any(issue.code == "literal-secret" for issue in issues(job, definition_adapter))
 
@@ -111,3 +110,77 @@ def test_input_resolution_preserves_non_input_references():
     assert missing == []
     assert resolved["steps"][0]["sql"] == "SELECT :tenant AS id"
     assert resolved["connections"]["db"]["password"] == "secret-value"
+
+
+def test_spark_only_sql_validates_and_orders_the_steps(definition_adapter):
+    job = sample_job()
+    job["steps"] = [
+        {"name": "items", "sql": "SELECT id, item FROM rows LATERAL VIEW explode(array(1, 2)) t AS item "
+                                 "DISTRIBUTE BY id"},
+        {"name": "rows", "sql": "SELECT :tenant AS id"},
+    ]
+    assert issues(job, definition_adapter) == []
+    assert SparkRules({}).dependencies_of(job["steps"][0]) == ["rows"]
+
+
+def test_runtime_limits_are_typed_and_an_unknown_one_names_the_engine(definition_adapter):
+    job = sample_job()
+    job["runtime"]["limits"] = {"events": 5, "max_files_per_batch": 10}
+    assert issues(job, definition_adapter) == []
+    job["runtime"]["limits"] = {"events": "many", "bogus_key": 1}
+    found = {(issue.code, issue.path): issue.message for issue in issues(job, definition_adapter)}
+    assert ("bad-type", "runtime.limits.events") in found
+    assert "Spark engine has no runtime.limits.bogus_key" in found[("unsupported-key", "runtime.limits.bogus_key")]
+
+
+@pytest.mark.parametrize("value", [0, "many", 1.5])
+def test_runtime_limits_call_records_is_an_integer_of_at_least_one(definition_adapter, value):
+    job = sample_job()
+    job["runtime"]["limits"] = {"call_records": 1}
+    assert issues(job, definition_adapter) == []
+    job["runtime"]["limits"] = {"call_records": value}
+    assert [issue.path for issue in issues(job, definition_adapter)] == ["runtime.limits.call_records"]
+
+
+def test_only_the_constants_the_engine_renders_are_accepted_and_only_where_it_renders_them(definition_adapter):
+    job = sample_job()
+    job["steps"][0]["sql"] = "SELECT '{{ batch.id }}' AS id"
+    assert [issue.code for issue in issues(job, definition_adapter)] == ["unrendered-reference"]
+    job["steps"][0]["sql"] = "SELECT :batch_id AS id"
+    job["outputs"][0]["operation"]["arguments"]["path"] = "out/{{ batch_seq }}/"
+    assert [issue.code for issue in issues(job, definition_adapter)] == ["unknown-reference"]
+
+
+def test_an_adapters_own_tokens_are_accepted_only_in_its_arguments(definition_adapter):
+    operations = (Operation(service="database", method="put", kind=OperationKind.WRITE),)
+    staging = definition_adapter("staging", SimpleNamespace(template_tokens=("uuid",)), operations=operations)
+    rules = SparkRules({"table": definition_adapter("table", object(), operations=operations), "staging": staging})
+    job = sample_job()
+    job["connections"]["db"] = {"provider": "staging"}
+    job["connections"]["other"] = {"provider": "table"}
+    job["outputs"][0]["operation"]["arguments"]["staging_table"] = "stg_{{ uuid }}"
+    job["outputs"].append(dict(job["outputs"][0], name="copy", connection="other"))
+    found = [(issue.code, issue.path) for issue in check_shared(job, rules)]
+    assert found == [("unsupported-reference", "outputs[1].operation.arguments")]
+
+
+
+@pytest.mark.parametrize(("log", "valid"), [
+    ({"message": "row {id}", "level": "warning", "max_rows": 1000}, True),
+    ({"message": "x", "level": "error"}, False), ({"message": "x", "max_rows": 0}, False),
+    ({"message": "x", "max_rows": 1001}, False), ({"message": "x", "lines": 2}, False), ({"level": "info"}, False),
+    ({"message": ""}, False), ({"message": "{a b}"}, False),
+])
+def test_a_steps_log_is_checked_as_duckdbjob_checks_it(definition_adapter, log, valid):
+    job = sample_job()
+    job["steps"][0]["log"] = log
+    duckdb_job = {"kind": "DuckDBJob", "name": "sample",
+                  "connections": {"wh": {"provider": "duckdb", "path": ":memory:"}},
+                  "steps": [{"name": "rows", "sql": "SELECT 1 AS id", "log": log}],
+                  "outputs": [{"name": "o", "connection": "wh", "step": "rows", "table": "t", "mode": "overwrite"}]}
+    found = [(i.code, i.path, i.message) for i in issues(job, definition_adapter)]
+    assert found == [(i.code, i.path, i.message) for i in validate_duckdb_job(duckdb_job).issues]
+    assert (found == []) is valid
+    del job["steps"][0]["log"]
+    job["outputs"][0]["log"] = {"message": "x"}
+    assert [i.path for i in issues(job, definition_adapter)] == ["outputs[0].log"]

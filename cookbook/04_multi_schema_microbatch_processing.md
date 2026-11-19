@@ -31,14 +31,15 @@ Groups files by format, delimiter options, and exact header signature. Each grou
 ```yaml
   - name: incoming_orders
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path: "{{ arrivals.payload.file_uri }}"
-      format: auto
-      schema_mode: by_name
-      options:
-        header: true
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ arrivals.payload.file_uri }}"
+        format: auto
+        schema_mode: by_name
+        options:
+          header: true
 ```
 - **Order Preservation**: Files with differing column order land in distinct groups, perfectly aligned by column name.
 - **Extra Columns**: Extra columns in any file are preserved and filled with `NULL` for files lacking them.
@@ -50,15 +51,16 @@ Enforces that every file in the batch shares the exact header signature as the b
 ```yaml
   - name: partner_events
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path: "{{ arrivals.payload.file_uri }}"
-      format: csv
-      schema_mode: strict
-      on_mismatch: skip         # "skip" routes to _file_errors; "error" halts the batch
-      options:
-        header: true
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ arrivals.payload.file_uri }}"
+        format: csv
+        schema_mode: strict
+        on_mismatch: skip         # "skip" routes to _file_errors; "error" halts the batch
+        options:
+          header: true
 ```
 - Any file with reordered, missing, or extra columns is rejected into the `_file_errors` view with an explanatory reason (e.g., `schema mismatch: differing column at position 1: 'amount' (expected 'order_id')`).
 
@@ -68,58 +70,59 @@ Harmonizes diverse client schemas into a single canonical vocabulary. Supports e
 ```yaml
   - name: harmonized_orders
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path: "{{ arrivals.payload.file_uri }}"
-      format: auto
-      on_unmapped_column: warn  # ignore | warn | reject
-      on_mismatch: skip
-      row_errors: true          # adds _row_errors ARRAY<STRING>
-      # Named regex extraction: extracts variables from URI and auto-injects them as DataFrame columns!
-      path_pattern: "partners/(?P<partner>[^/]+)/"
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ arrivals.payload.file_uri }}"
+        format: auto
+        on_unmapped_column: warn  # ignore | warn | reject
+        on_mismatch: skip
+        row_errors: true          # adds _row_errors ARRAY<STRING>
+        # Named regex extraction: extracts variables from URI and auto-injects them as DataFrame columns!
+        path_pattern: "partners/(?P<partner>[^/]+)/"
 
-      vocabulary:
-        - {name: order_id,    type: bigint}
-        - {name: customer_id, type: string}
-        - {name: amount,      type: double}
+        vocabulary:
+          - {name: order_id,    type: bigint}
+          - {name: customer_id, type: string}
+          - {name: amount,      type: double}
 
-      # Option 1: Dict-based mapping grouped by extracted variable
-      columns:
-        by: partner
+        # Option 1: Dict-based mapping grouped by extracted variable
+        columns:
+          by: partner
 
-        alpha:
-          - regex: "(?i)^order[_\s]?(num|id|no)$"
-            canonical: "order_id"
-            type: "bigint"
-            required: true
-          - header: "AmountUSD"
-            canonical: "amount"
-            type: "double"
-            required: true
+          alpha:
+            - regex: "(?i)^order[_\s]?(num|id|no)$"
+              canonical: "order_id"
+              type: "bigint"
+              required: true
+            - header: "AmountUSD"
+              canonical: "amount"
+              type: "double"
+              required: true
 
-        beta:
-          - regex: "(?i)^txn[_\s]?id$"
-            canonical: "order_id"
-            type: "bigint"
-            required: true
-          - header: "total"
-            canonical: "amount"
-            type: "double"
-            required: true
+          beta:
+            - regex: "(?i)^txn[_\s]?id$"
+              canonical: "order_id"
+              type: "bigint"
+              required: true
+            - header: "total"
+              canonical: "amount"
+              type: "double"
+              required: true
 
-      # Option 2 (Alternative): Traditional flat list with prefix: or path_regex:
-      # columns:
-      #   - prefix: "s3://landing/partners/alpha/"
-      #     header: "Order_Num"
-      #     canonical: "order_id"
-      #     type: "bigint"
-      #     required: true
-      #   - path_regex: ".*/inbox/.*_beta_.*\\.csv$"
-      #     regex: "(?i)^txn[_\s]?id$"
-      #     canonical: "order_id"
-      #     type: "bigint"
-      #     required: true
+        # Option 2 (Alternative): Traditional flat list with prefix: or path_regex:
+        # columns:
+        #   - prefix: "s3://landing/partners/alpha/"
+        #     header: "Order_Num"
+        #     canonical: "order_id"
+        #     type: "bigint"
+        #     required: true
+        #   - path_regex: ".*/inbox/.*_beta_.*\\.csv$"
+        #     regex: "(?i)^txn[_\s]?id$"
+        #     canonical: "order_id"
+        #     type: "bigint"
+        #     required: true
 ```
 - **Named Regex Extraction (`path_pattern`)**: Extracts variables (such as `partner`) and automatically projects them onto the DataFrame (`h.partner`).
 - **Dict Dispatch (`by: <variable>`)**: Dispatches files to schema mapping groups directly based on the extracted variable, avoiding repetitive `prefix:` declarations.
@@ -133,24 +136,25 @@ In many ingestion workloads (e.g. IoT telemetry, server metrics, ad tracking, or
 ```yaml
   - name: telemetry_events
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path: "{{ arrivals.payload.file_uri }}"
-      format: csv
-      schema_mode: by_name
-      column_groups:
-        # Wildcard glob matching (e.g. metric_cpu -> cpu)
-        - name: metrics
-          glob: "metric_*"
-          type: double
-          strip_prefix: "metric_"    # optional: strips prefix from map key
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ arrivals.payload.file_uri }}"
+        format: csv
+        schema_mode: by_name
+        column_groups:
+          # Wildcard glob matching (e.g. metric_cpu -> cpu)
+          - name: metrics
+            glob: "metric_*"
+            type: double
+            strip_prefix: "metric_"    # optional: strips prefix from map key
 
-        # Regular expression matching (e.g. tag_alpha -> tag_alpha)
-        - name: tags
-          regex: "^tag_[a-z0-9]+$"
-          type: string
-          # strip_prefix omitted: map key remains full column name
+          # Regular expression matching (e.g. tag_alpha -> tag_alpha)
+          - name: tags
+            regex: "^tag_[a-z0-9]+$"
+            type: string
+            # strip_prefix omitted: map key remains full column name
 ```
 
 Key guarantees of `column_groups:`:
@@ -168,18 +172,19 @@ StreamWright Spark solves this by attaching the row numbering projection **lazil
 ```yaml
   - name: harmonized_feed
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path: "{{ arrivals.payload.file_uri }}"
-      format: auto
-      # Options:
-      # 1. Default toggle (emits `_row_index BIGINT`, 0-indexed):
-      # row_index: true
-      # 2. String alias (emits `row_id BIGINT`, 0-indexed):
-      row_index: "row_id"
-      # 3. Custom name and 1-indexed line offset:
-      # row_index: {name: "line_number", start: 1}
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ arrivals.payload.file_uri }}"
+        format: auto
+        # Options:
+        # 1. Default toggle (emits `_row_index BIGINT`, 0-indexed):
+        # row_index: true
+        # 2. String alias (emits `row_id BIGINT`, 0-indexed):
+        row_index: "row_id"
+        # 3. Custom name and 1-indexed line offset:
+        # row_index: {name: "line_number", start: 1}
 ```
 
 Key guarantees of `row_index:`:
@@ -235,10 +240,11 @@ A file receives `status: drift` if:
 outputs:
   - name: audit_drift
     connection: ops_db
-    service: database
-    method: write
-    arguments:
-      table: schema_drift_log
+    operation:
+      service: database
+      method: write
+      arguments:
+        table: schema_drift_log
     sql: |
       SELECT step, path, prefix, status, header_hash,
              array_join(unmapped, ',') AS unmapped_columns,
@@ -277,14 +283,15 @@ When writing to Delta Lake, StreamWright provides explicit control over schema c
 outputs:
   - name: orders_delta
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3://{{ config.lake_bucket }}/delta/orders"
-      schema_evolution: add_columns   # strict (default) | add_columns
-      condition: "target.order_id = source.order_id"
-      # ...
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3://{{ config.lake_bucket }}/delta/orders"
+        schema_evolution: add_columns   # strict (default) | add_columns
+        condition: "target.order_id = source.order_id"
+        # ...
 ```
 
 - **`strict` (default)**: Rejects mismatched schemas to protect downstream analytics consumers.
@@ -302,8 +309,10 @@ runtime:
   limits:
     read_groups: 200              # Maximum allowed distinct header signatures
     max_files_per_batch: 2000     # Batch file count ceiling
-    listing_parallelism: 16       # Driver threads for header/exists checks
 ```
+
+`runtime.limits` takes DuckDBJob's keys with the same meaning (`reference_values`, `read_groups`, `events`,
+`apply_rows`) plus `max_files_per_batch`; any other key is an error naming the Spark engine.
 
 ### Inspecting Summary Statistics
 Run with `--summary` to print ingest metrics upon batch completion:

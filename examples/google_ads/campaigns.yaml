@@ -66,22 +66,28 @@ steps:
   # CALL STEP: run the google_ads source connector on the driver; records -> DataFrame.
   - name: raw_campaigns
     connection: google_ads_api
-    service: GoogleAdsService
-    method: search_stream
+    operation:
+      service: GoogleAdsService
+      method: search_stream
+      arguments:
+        customer_id: "{{ config.customer_id }}"
+        query: |
+          SELECT campaign.id, campaign.name, campaign.status
+          FROM campaign
+          ORDER BY campaign.id
+          LIMIT 50
     # execution policy (§6a): retry transient gRPC errors, throttle, bound the call, page the load
-    retry: {max_attempts: 5, backoff: exponential, max_delay: 30s}
-    rate_limit: {requests: 2, per: 1s}
-    timeout: 60s
-    page_size: 1000
-    on_error: fail
-    arguments:
-      customer_id: "{{ config.customer_id }}"
-      query: |
-        SELECT campaign.id, campaign.name, campaign.status
-        FROM campaign
-        ORDER BY campaign.id
-        LIMIT 50
-    sql: SELECT * FROM input
+    policy:
+      retry: {max_attempts: 5, backoff: exponential, max_delay: 30s}
+      rate_limit: {requests: 2, per: 1s}
+      timeout: 60s
+      page_size: 1000
+      on_error: fail
+    # the sql reads `records`: one `record` column, each record's JSON text (a DuckDBJob call step's shape), so the
+    # step has the same columns in a batch that reads no campaigns
+    sql: |
+      SELECT from_json(record, 'campaign STRUCT<id: STRING, name: STRING, status: STRING>').campaign AS campaign
+      FROM records
 
   - name: campaign_metrics
     sql: |
@@ -92,15 +98,17 @@ steps:
 outputs:
   - name: save_campaigns
     connection: lake_s3
-    service: object
-    method: write
+    operation:
+      service: object
+      method: write
+      arguments:
+        path: "s3://{{ config.lake_bucket }}/google_ads/campaign_metrics/"
+        format: parquet
+        mode: overwrite
     # retry a transient object-store write; a failed write fails the batch (on_error defaults to fail)
-    retry: {max_attempts: 3}
-    timeout: 120s
-    arguments:
-      path: "s3://{{ config.lake_bucket }}/google_ads/campaign_metrics/"
-      format: parquet
-      mode: overwrite
+    policy:
+      retry: {max_attempts: 3}
+      timeout: 120s
     sql: SELECT * FROM campaign_metrics
 
 runtime:

@@ -34,20 +34,14 @@ def err(text):
 
 
 def add_job_arguments(parser, many=False, inputs=True):
-    """The job path options (--file and --pipeline are aliases of --job); `inputs`: also --config, --set."""
+    """The job path options (JOB or --job); `inputs`: also --config, --set."""
     if many:
         parser.add_argument("job", nargs="*", metavar="JOB", help="job manifests: YAML files, or their folders")
         parser.add_argument("--job", "-j", action="append", default=[], dest="flag_jobs", metavar="JOB",
                             help="a job manifest, as an option (repeatable)")
-        parser.add_argument("--file", "-f", action="append", default=[], dest="flag_files", metavar="JOB",
-                            help="the same as --job")
-        parser.add_argument("--pipeline", action="append", default=[], dest="flag_pipelines", metavar="JOB",
-                            help="the same as --job")
     else:
         parser.add_argument("job", nargs="?", metavar="JOB", help=JOB_HELP["job"])
         parser.add_argument("--job", "-j", dest="flag_job", metavar="JOB", help=JOB_HELP["job_option"])
-        parser.add_argument("--file", "-f", dest="flag_file", metavar="JOB", help="the same as --job")
-        parser.add_argument("--pipeline", dest="flag_pipeline", metavar="JOB", help="the same as --job")
     if inputs:
         parser.add_argument("--config", metavar="FILE", help=JOB_HELP["config"])
         parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help=JOB_HELP["set"])

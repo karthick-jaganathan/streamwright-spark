@@ -31,17 +31,19 @@ connections:
 steps:
   - name: orders
     connection: lake
-    service: object
-    method: read
-    arguments: {path: "raw/orders/*.csv", format: csv, options: {header: true}}
+    operation:
+      service: object
+      method: read
+      arguments: {path: "raw/orders/*.csv", format: csv, options: {header: true}}
   - name: daily_totals
     sql: SELECT CAST(ordered_at AS DATE) AS day, COUNT(*) AS orders FROM orders GROUP BY 1
 outputs:
   - name: save_totals
     connection: lake
-    service: object
-    method: write
-    arguments: {path: "/data/lake/curated/daily_totals/", format: parquet, mode: overwrite}
+    operation:
+      service: object
+      method: write
+      arguments: {path: "/data/lake/curated/daily_totals/", format: parquet, mode: overwrite}
     sql: SELECT * FROM daily_totals
 runtime:
   state: {sqlite: /data/state/daily_orders.db}

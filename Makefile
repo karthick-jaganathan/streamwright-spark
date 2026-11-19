@@ -45,7 +45,8 @@ FORCE_DEPS ?= false
 DIST_DIR = /tmp/sdist/streamwright-spark
 
 .PHONY: help install uninstall verify clean clean-dist build lint test pytest \
-	validate validate-order-files validate-partner-orders up down logs seed-order-files seed-partner-orders \
+	validate validate-order-files validate-partner-orders validate-google-ads up down logs seed-order-files \
+	seed-partner-orders \
 	lakehouse publish-s3 submit-order-files submit-partner-orders trino
 
 # ==============================================================================
@@ -70,6 +71,7 @@ help:            ## show available commands
 	@echo "  make validate                       - Validate all example jobs"
 	@echo "  make validate-order-files           - Validate examples/kafka/order_files.yaml"
 	@echo "  make validate-partner-orders        - Validate examples/s3/partner_orders.yaml with local overlay"
+	@echo "  make validate-google-ads            - Validate examples/google_ads/campaigns.yaml"
 	@echo ""
 	@echo "Docker Infrastructure & Local Services:"
 	@echo "  make up                             - Start Postgres, LocalStack, and Kafka in Docker"
@@ -88,6 +90,8 @@ help:            ## show available commands
 	@echo "  MODE=prod  - Production mode (pip install .[all]) [DEFAULT]"
 	@echo "  MODE=dev   - Development mode (pip install -e .[all])"
 	@echo "  MODE=dist  - Distribution mode (build + install from $(DIST_DIR))"
+	@echo ""
+	@echo "Options: PYTHON=path/to/python, RUFF=path/to/ruff, FORCE_DEPS=true"
 
 # ==============================================================================
 # Package Lifecycle (Install, Uninstall, Build, Clean, Verify)
@@ -122,7 +126,9 @@ uninstall:       ## uninstall streamwright-spark
 
 # Clean temporary compilation artifacts, bytecode, caches, and test outputs
 clean:           ## clean build, dist, and pytest artifacts
-	find . -type d \( -name "__pycache__" -o -name "*.egg-info" -o -name ".pytest_cache" -o -name "build" -o -name "dist" \) -exec rm -rf {} + 2>/dev/null || true
+	find . -type d \( -name "__pycache__" -o -name "*.egg-info" -o -name ".pytest_cache" -o -name "build" -o -name "dist" \
+		-o -name ".ruff_cache" -o -name "spark-warehouse" -o -name "metastore_db" \) -prune -exec rm -rf {} + 2>/dev/null || true
+	rm -f derby.log
 	@echo "✅ Build and test artifacts cleaned!"
 
 # Clean distribution directory where build wheels and tarballs are staged
@@ -143,7 +149,8 @@ verify:          ## verify streamwright-spark installation
 	@echo "Verifying $(PACKAGE_NAME) installation..."
 	@$(PYTHON) -m pip show $(PACKAGE_NAME) >/dev/null 2>&1 && echo "  ✅ $(PACKAGE_NAME) is installed!" || echo "  ❌ $(PACKAGE_NAME) is not installed!"
 	@$(PYTHON) -c "import streamwright.spark; print('  ✅ streamwright.spark import works!')" 2>/dev/null || echo "  ❌ streamwright.spark import failed!"
-	@streamwright-spark --help >/dev/null 2>&1 && echo "  ✅ streamwright-spark command works!" || echo "  ❌ streamwright-spark command failed!"
+	@$(PYTHON) -m streamwright.spark.cli --help >/dev/null 2>&1 && echo "  ✅ streamwright-spark command works!" || echo "  ❌ streamwright-spark command failed!"
+	@$(PYTHON) -m streamwright.core.cli spark --help >/dev/null 2>&1 && echo "  ✅ streamwright spark (sw spark) is registered!" || echo "  ❌ streamwright spark is not registered (is streamwright installed?)"
 
 # ==============================================================================
 # Testing
@@ -169,7 +176,7 @@ pytest: test     ## lint and run unit tests with pytest
 # ==============================================================================
 
 # Validate all example jobs statically without requiring active Spark or remote clusters
-validate: validate-order-files validate-partner-orders  ## validate all example jobs
+validate: validate-order-files validate-partner-orders validate-google-ads  ## validate all example jobs
 
 # Validate the kafka_order_files example job:
 # Verifies connection schemas, two-phase staging tables, Delta Lake merge configs,
@@ -183,6 +190,10 @@ validate-order-files:     ## validate examples/kafka/order_files.yaml
 validate-partner-orders: ## validate examples/s3/partner_orders.yaml with local overlay
 	$(PYTHON) -B -m streamwright.spark.cli validate examples/s3/partner_orders.yaml --overlay examples/s3/partner_orders.local.yaml --analyze --strict
 
+# Validate the Google Ads example job (needs the streamwright-google-ads connector installed)
+validate-google-ads:     ## validate examples/google_ads/campaigns.yaml
+	$(PYTHON) -B -m streamwright.spark.cli validate examples/google_ads/campaigns.yaml --strict
+
 # ==============================================================================
 # Local Infrastructure & Docker Services
 # ==============================================================================
@@ -190,7 +201,7 @@ validate-partner-orders: ## validate examples/s3/partner_orders.yaml with local 
 # Start base local backing services in background containers:
 #   - LocalStack: Mock AWS S3 (landing, lake, and code buckets)
 #   - PostgreSQL: Stores state store locks, batch leases, and relational audit tables
-#   - Kafka + Zookeeper: Event notification message bus and outbox triggers
+#   - Kafka (single-node KRaft): Event notification message bus and outbox triggers
 up:              ## start Postgres, LocalStack, and Kafka in Docker
 	docker compose up -d --wait
 

@@ -17,11 +17,11 @@
 
 """The Spark engine contract for declarative connectors."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from streamwright.core.jobs import Message, WriteReceipt
+from streamwright.core.jobs import WriteReceipt
 from streamwright.core.jobs.types import Observation
 from streamwright.core.sdk.contract import Operation, ResolvedConnection
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from streamwright.spark.engine.runtime import StepRuntime
 
-__all__ = ["Observation", "SparkAdapter", "SparkContext", "SparkMessagingAdapter", "WriteReceipt"]
+__all__ = ["Observation", "SparkAdapter", "SparkContext", "WriteReceipt"]
 
 
 @dataclass(frozen=True)
@@ -55,18 +55,3 @@ class SparkAdapter(Protocol):
         self, context: SparkContext, frame: "DataFrame", operation: Operation, arguments: Mapping[str, Any]
     ) -> WriteReceipt: ...
 
-
-class SparkMessagingAdapter(Protocol):
-    def poll(
-        self,
-        arguments: Mapping[str, Any],
-        limit: int,
-        max_wait_seconds: float,
-        watermarks: Mapping[str, Any] | None = None,
-    ) -> list[Message]: ...
-
-    def ack(self, messages: Sequence[Message], arguments: Mapping[str, Any]) -> None: ...
-
-    def publish(self, arguments: Mapping[str, Any], events: Sequence[dict[str, Any]], dedupe_key: str) -> None: ...
-
-    def destination(self, arguments: Mapping[str, Any]) -> str: ...

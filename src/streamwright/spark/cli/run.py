@@ -26,6 +26,8 @@ from streamwright.core.cli.jobs import batch_mode
 from streamwright.core.cli.log_options import log_setup
 from streamwright.core.config.inputs import InputError, parse_duration
 from streamwright.core.jobs import BrokerCall, Runner
+from streamwright.core.jobs.apply.delivery import Applier, apply_calls
+from streamwright.core.jobs.grammar import to_internal
 from streamwright.core.jobs.inputs import effective_config
 from streamwright.core.jobs.inputs import secret_values as typed_secrets
 from streamwright.core.jobs.locking import applies_migrations, check_key, lock_plan, resolve_failed_job_policy
@@ -35,7 +37,8 @@ from streamwright.core.jobs.lookups.passes import run_passes
 from streamwright.core.jobs.manifest import manifest_directory
 from streamwright.core.jobs.refs import references
 from streamwright.core.jobs.state import StateError
-from streamwright.core.runtime import logs
+from streamwright.core.runtime import components, logs
+from streamwright.core.runtime.logs.context import log_context, new_request_id
 from streamwright.core.runtime.logs.lines import fields, utc_now
 from streamwright.core.runtime.redact import Redactor
 from streamwright.core.sdk.contract import InvalidConnectionError
@@ -52,7 +55,7 @@ from streamwright.spark.job.reader import resolve_job_location
 from streamwright.spark.plan import build_plan, role_of
 from streamwright.spark.runtime import lock as lockmod
 
-__all__ = ["add_arguments", "run"]  # add_arguments: run_options
+__all__ = ["add_arguments", "apply_connectors", "run"]  # add_arguments: run_options
 
 LOG = logging.getLogger("streamwright.spark")
 
@@ -120,7 +123,8 @@ def _run(args):
         return _submit(submission, args, lock, submission["runtime"]["platform"], launchers[platform["type"]])
     started, outcome, code, failure = utc_now(), {}, None, None
     try:
-        code = _drive(job, adapters, args, config, lock, outcome=outcome)
+        with log_context(request_id=new_request_id()):       # one id for every line and batch of this run
+            code = _drive(job, adapters, args, config, lock, outcome=outcome)
         return code
     except BaseException as exc:
         failure = exc
@@ -157,7 +161,7 @@ def _spark_conf(job, extra_conf):
 
 def _preview_dry_run(job, adapters, args, *, lock, platform, launcher):
     print("Execution Plan:")
-    print(build_plan(job, adapters).describe())
+    print(build_plan(to_internal(job), adapters).describe())
     print("\nLaunch Submission (platform: %s):" % platform["type"])
     conf = _spark_conf(job, args.conf)
     files = list(args.overlay) + ([args.config] if args.config else [])
@@ -293,11 +297,19 @@ def _drive(job, adapters, args, config, lock, *, outcome):
     return 1 if any(item.status != "ok" for item in outcomes) else 0
 
 
+def apply_connectors(adapters):
+    """
+    The connectors an output may call as an apply output: the installed ones without a Spark adapter (an output on a
+    connection whose provider has one is that adapter's write, e.g. `database.write`), as the job's checks decide.
+    """
+    return {name for name in components.available() if name not in adapters}
+
+
 def _drive_one(job, adapters, args, config, secrets, *, lock, outcome):
     """On the driver (local, or inside the cluster): verify, connect, run the batch loop. Needs Spark."""
     executor_type = import_module("streamwright.spark.engine.executor").SparkExecutor
     session_module = import_module("streamwright.spark.engine.session")
-
+    job = to_internal(job)                       # the engine reads the internal shape (core jobs.grammar)
     resolved, problems = resolve(job, config, secrets)
     for text in problems:
         _error(text)
@@ -354,10 +366,13 @@ def _drive_one(job, adapters, args, config, secrets, *, lock, outcome):
         return executor_type(
             spark, pinned_job, connections, adapters, config=pinned, limits=pinned_job["runtime"].get("limits"),
             state=store, declared_connections=(job.get("connections") or {}), secrets=secrets,
-            allowed_connectors=getattr(args, "allow_connector", None),
+            allowed_connectors=getattr(args, "allow_connector", None), apply_outputs=applier.calls, redact=redact,
         )
 
     consumer, publishers = _broker_calls(resolved, connections, adapters)
+    redact = Redactor(secrets.values())          # one instance: tokens a connector obtains are masked everywhere
+    applier = Applier(apply_calls(resolved, job.get("connections") or {}, apply_connectors(adapters)),
+                      config=config, secrets=secrets, redact=redact)
 
     mode = batch_mode(args)
     runner = Runner(
@@ -366,16 +381,21 @@ def _drive_one(job, adapters, args, config, secrets, *, lock, outcome):
         None,
         consumer,
         publishers,
-        redact=Redactor(secrets.values()),
+        redact=redact,
+        lease_seconds=(resolved["runtime"].get("state") or {}).get("ttl_seconds", 300),
         engine_metadata={"app_id": app_id, "driver_host": driver_host},
         scope=state_lock.scope,
         lock=state_lock,
         prepare=prepare,
         failed_jobs=failed_jobs,
+        applier=applier,
     )
     outcome.update(runner=runner, store=store, job=resolved["name"])
     interval = parse_duration(args.interval or "10s").total_seconds()
-    return runner.run(mode, interval, args.max_messages, _job_key(args, resolved))
+    try:
+        return runner.run(mode, interval, args.max_messages, _job_key(args, resolved))
+    finally:
+        applier.close()
 
 
 def _job_key(args, job):

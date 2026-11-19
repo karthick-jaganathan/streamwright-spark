@@ -29,7 +29,6 @@ from streamwright.core.cli.jobs import (
     add_fan_out_arguments,
     add_job_key_argument,
     add_lock_arguments,
-    add_renamed_option,
     batch_problems,
 )
 from streamwright.core.cli.log_options import add_log_options
@@ -70,9 +69,6 @@ def add_arguments(parser):
     parser.add_argument("--lock-required", action="store_true",
                         help="refuse to run without a valid dependency lock file (--lock)")
     add_apply_migrations_argument(parser)
-    add_renamed_option(parser, "--no-init-state",
-                       message="--no-init-state is not needed: a run no longer creates or upgrades the state tables "
-                               "(--apply-state-migrations makes it)")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="validate and resolve the job, then print its plan and the submission it would launch (the spark-submit "

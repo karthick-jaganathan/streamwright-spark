@@ -116,7 +116,7 @@ def _normalize_job_args(args):
         resolve_job(args.parser, args)
         return True
     if hasattr(args, "flag_job"):
-        flag_val = args.flag_job or getattr(args, "flag_file", None) or getattr(args, "flag_pipeline", None)
+        flag_val = args.flag_job
         if flag_val:
             if args.job and args.job != flag_val:
                 err("error: pass the job once: JOB or --job JOB")
@@ -127,12 +127,7 @@ def _normalize_job_args(args):
             return False
 
     if hasattr(args, "flag_jobs"):
-        jobs = (
-            list(args.job or [])
-            + list(args.flag_jobs or [])
-            + list(getattr(args, "flag_files", None) or [])
-            + list(getattr(args, "flag_pipelines", None) or [])
-        )
+        jobs = list(args.job or []) + list(args.flag_jobs or [])
         if not jobs:
             err("error: at least one job path is required (pass PATH positional argument or --job PATH)")
             return False

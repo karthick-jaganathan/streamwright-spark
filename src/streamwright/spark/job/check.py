@@ -29,7 +29,7 @@ NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def check_job(job, adapters, launchers=None):
-    """Compatibility for the Spark CLI's problem/warning rendering; all checks run in core."""
+    """(errors, warnings) of `job` as text, for the Spark CLI; the checks run in core with the Spark rules."""
     issues = check_shared_job(job, SparkRules(adapters, launchers))
     return (
         [str(issue) for issue in issues if issue.severity == "error"],

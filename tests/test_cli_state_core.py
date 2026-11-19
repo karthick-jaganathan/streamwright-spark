@@ -66,11 +66,9 @@ def test_state_cli_uses_core_schema_and_batch_fields(monkeypatch, tmp_path, caps
     assert main(["state", "purge", job_path, "--older-than", "0s"]) == 0
     assert "purged 1" in capsys.readouterr().out
     assert main(["state", "check", job_path]) == 0
-    for dropped in (["state", "init", job_path], ["state", "show", "--file", job_path, "sparkjob-00000001"],
-                    ["state", "list", job_path, "--log-level", "DEBUG"], ["state", "purge", job_path, "30"]):
-        with pytest.raises(SystemExit) as usage:                           # old names and options of no use here
-            main(dropped)
-        assert usage.value.code == 2
+    with pytest.raises(SystemExit) as usage:                               # only retry, which runs the job, logs
+        main(["state", "list", job_path, "--log-level", "DEBUG"])
+    assert usage.value.code == 2
 
 
 def test_sqlite_state_resolves_relative_to_job_directory_not_current_directory(tmp_path, monkeypatch):

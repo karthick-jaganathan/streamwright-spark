@@ -17,54 +17,40 @@
 
 """Spark-only rule tables and adapter hooks for the shared jobs checker."""
 
-import re
 from types import MappingProxyType
 
 from streamwright.core.jobs import JobRules
+from streamwright.core.jobs.apply.log import OUTPUT_LOG_FIELD
+from streamwright.core.jobs.apply.rules import check_apply, is_apply_output
 from streamwright.core.jobs.calls import call_problems, connection_problems, partition_problems
-from streamwright.core.jobs.check.rules import NAME_PATTERN, input_field, install_hint
+from streamwright.core.jobs.check.rules import NAME_PATTERN, RESERVED_NAMES, input_field, install_hint
 from streamwright.core.jobs.fields import Field
+from streamwright.core.jobs.grammar import APPLY_FIELD, CONNECTION_GROUPS, OPERATION_FIELD, POLICY_FIELD
 from streamwright.core.jobs.locking import STATE_FIELDS
 from streamwright.core.jobs.log_labels import LOG_FIELD
 from streamwright.core.jobs.lookups.rules import FAN_OUT_FIELD, LOOKUPS_FIELD
 from streamwright.core.jobs.policy import OUTPUT_POLICY_KEYS, STEP_POLICY_KEYS
+from streamwright.core.jobs.refs import references, walk_strings
+from streamwright.core.jobs.step_log import LOG_KEY, STEP_LOG_FIELD
 from streamwright.core.jobs.write_rules import OutputSpec, WriteTarget, warn_merge_scope
 from streamwright.core.runtime import components
 from streamwright.core.sdk.contract import check_arguments, check_connection
 from streamwright.spark.job.runtime_rules import check_platform, check_runtime
-from streamwright.spark.plan.analysis import _dependencies
+from streamwright.spark.job.vocabulary import BUILTIN_REFERENCES, LIMITS_FIELD, RECORDS_VIEW, storage_level_name
+from streamwright.spark.plan.analysis import dependencies, sql_parameters
 
 __all__ = ["SparkRules"]
 
 _TEXT = Field("string")
-# the execution-policy vocabulary (contract v1.2 §6a), accepted structurally on steps and outputs
-_POLICY_FIELDS = MappingProxyType({
-    "retry": Field("object"), "rate_limit": Field("object"), "paginator": Field("object"),
-    "page_size": Field("integer", minimum=1), "on_error": _TEXT,
-    "timeout": Field(("number", "string"), description="per-call timeout, seconds or a duration like `30s`"),
-})
-# a source-connector call step (contract v1.2 §6a engine reach): service/method or an HTTP request, run on the driver
+# a source-connector call step (contract v1.2 §6a engine reach): an `operation:`, run on the driver
 _CALL_FIELDS = MappingProxyType({
-    "service": _TEXT, "method": _TEXT, "arguments": Field("object"),
-    "request": Field("object", fields={"path": _TEXT, "method": _TEXT, "params": Field("object"),
-                                       "headers": Field("object"), "json": Field(), "records": Field("object")}),
     # one call per distinct value of an earlier step's column, read as {{ partition.<name> }} (core jobs.calls)
     "partitions": Field("array", items=Field("object", fields={"from": Field("string", required=True),
                                                                "field": Field("string", required=True),
                                                                "name": _TEXT})),
 })
-_STORAGE_LEVELS = frozenset({
-    "MEMORY_ONLY", "MEMORY_ONLY_2", "MEMORY_ONLY_SER", "MEMORY_ONLY_SER_2", "MEMORY_AND_DISK", "MEMORY_AND_DISK_2",
-    "MEMORY_AND_DISK_SER", "MEMORY_AND_DISK_SER_2", "MEMORY_AND_DISK_DESER", "DISK_ONLY", "DISK_ONLY_2",
-    "DISK_ONLY_3", "OFF_HEAP", "NONE",
-})
-_PERSIST = MappingProxyType({"memory": "MEMORY_ONLY", "memory_and_disk": "MEMORY_AND_DISK", "disk": "DISK_ONLY"})
-_PARAMETER = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")
-_QUOTED = re.compile(r"'(?:[^']|'')*'")
 _REPLAY_SAFE_MODES = ("overwrite", "merge", "delete")
-_BUILTINS = frozenset((
-    "batch.id", "batch.ts", "batch.id_safe", "batch_id_safe", "batch.seq", "batch_seq", "driver.host", "driver_host",
-))
+_BUILTINS = frozenset(BUILTIN_REFERENCES)
 
 
 def _object(**fields):
@@ -78,14 +64,16 @@ def _contract_issue(issue):
 class SparkRules(JobRules):
     kind = "SparkJob"
     builtin_references = _BUILTINS
+    reserved_names = RESERVED_NAMES | {RECORDS_VIEW}
     step_reference_keys = frozenset(("arguments",))
     source_reference_keys = frozenset(("request", "paginator"))  # rendered by the source engine on a call step
     step_kinds = MappingProxyType(
         {
-            "sql": ("name", "sql", "persist", "checkpoint", "view"),
-            "call": ("name", "connection", "service", "method", "arguments", "sql", "persist", "checkpoint", "view"),
+            "sql": ("name", "sql", "persist", "checkpoint", "view", LOG_KEY),
+            "call": ("name", "connection", "service", "method", "arguments", "sql", "persist", "checkpoint", "view",
+                     LOG_KEY),
             "source_call": ("name", "connection", "service", "method", "arguments", "request", "partitions", "sql",
-                            "persist", "checkpoint", "view"),
+                            "persist", "checkpoint", "view", LOG_KEY),
         }
     )
 
@@ -106,22 +94,21 @@ class SparkRules(JobRules):
         item = {
             "name": Field("string", required=True, pattern=NAME_PATTERN),
             "connection": _TEXT,
-            "service": _TEXT,
-            "method": _TEXT,
-            "arguments": Field("object"),
+            "operation": OPERATION_FIELD,
             "sql": _TEXT,
             "persist": _TEXT,
             "checkpoint": Field("boolean"),
             "view": Field("string", enum=("local", "global")),
-            "request": _CALL_FIELDS["request"],
-            **_POLICY_FIELDS,
+            "partitions": _CALL_FIELDS["partitions"],
+            "apply": APPLY_FIELD,
+            "policy": POLICY_FIELD,
         }
         runtime = _object(
             state=_object(connection=_TEXT, schema=_TEXT, sqlite=_TEXT, ttl_seconds=Field("integer", minimum=1),
                           **STATE_FIELDS),
             spark=_object(app_name=_TEXT, version=_TEXT, conf=Field("object")),
             platform=Field("object"),
-            limits=Field("object"),
+            limits=LIMITS_FIELD,
             env=Field("object"),
             secrets=Field("object"),
             artifacts=Field("object"),
@@ -133,7 +120,7 @@ class SparkRules(JobRules):
             variants[provider] = {field.name: self._definition_field(field) for field in adapter.definition.connection}
         connection = Field(
             "object",
-            fields={"provider": Field("string", required=True)},
+            fields={"provider": Field("string", required=True), **CONNECTION_GROUPS},
             open=True,
             discriminator="provider",
             variants=variants,
@@ -146,12 +133,13 @@ class SparkRules(JobRules):
             spec=_object(config=Field("object", values=input_field()), secrets=Field("object", values=input_field()),
                          lookups=LOOKUPS_FIELD),
             connections=Field("object", required=True, min_items=1, values=connection),
-            steps=Field("array", items=Field("object", fields=dict(item, partitions=_CALL_FIELDS["partitions"]))),
+            steps=Field("array", items=Field("object", fields=dict(item, partitions=_CALL_FIELDS["partitions"],
+                                                                   log=STEP_LOG_FIELD))),
             outputs=Field(
                 "array",
                 required=True,
                 min_items=1,
-                items=Field("object", fields=dict(item, sql=Field("string", required=True))),
+                items=Field("object", fields=dict(item, sql=Field("string", required=True), log=OUTPUT_LOG_FIELD)),
             ),
             runtime=runtime,
         )
@@ -183,6 +171,12 @@ class SparkRules(JobRules):
 
     def output_policy_keys(self):
         return OUTPUT_POLICY_KEYS
+
+    def _applies(self, output, connection):
+        return connection.get("provider") not in self.adapters and is_apply_output(output, connection, self.connectors)
+
+    def check_apply(self, output, connection):
+        return check_apply(output, connection) if self._applies(output, connection) else None
 
     def _check_call(self, item, connection, is_step):
         adapter = self.adapters.get(connection["provider"])
@@ -245,18 +239,14 @@ class SparkRules(JobRules):
                 problems.append(("connector-not-installed",
                                  "provider %r has neither a Spark adapter nor an installed connector for calls: %s"
                                  % (provider, install_hint(provider)), False))
-            if "request" in step and ("service" in step or "method" in step):
-                problems.append(("bad-value", "a call is `request` (HTTP) or `service`/`method` (SDK), not both",
-                                 False))
-            elif "request" not in step and "service" not in step and "method" not in step:
-                problems.append(("missing-key", "a call step needs `service`/`method` or a `request`", False))
+            if "request" not in step and "service" not in step and "method" not in step:
+                problems.append(("missing-key", "a call step needs an `operation:`", False))
             elif provider in self.connectors:
                 problems += call_problems(step, connections[step["connection"]])
             problems += partition_problems(step)
-        if step.get("persist") is not None:
-            value = str(step["persist"]).strip()
-            if _PERSIST.get(value.lower(), value.upper()) not in _STORAGE_LEVELS:
-                problems.append(("bad-storage-level", "invalid Spark StorageLevel %r" % value, False))
+        if step.get("persist") is not None and storage_level_name(step["persist"]) is None:
+            problems.append(("bad-storage-level", "invalid Spark StorageLevel %r" % str(step["persist"]).strip(),
+                             False))
         return problems
 
     def check_connection(self, name, connection):
@@ -284,7 +274,7 @@ class SparkRules(JobRules):
         return tuple(description["secret_keys"]) if description else ()
 
     def dependencies_of(self, item):
-        return _dependencies(item)
+        return dependencies(item)
 
     def check_state(self, state, connections):
         if ("connection" in state) == ("sqlite" in state):
@@ -306,7 +296,8 @@ class SparkRules(JobRules):
                 if not isinstance(item, dict):
                     continue
                 path = (section, index)
-                if section == "outputs" and item.get("connection") in connections:
+                if section == "outputs" and item.get("connection") in connections and not self._applies(
+                        item, connections[item["connection"]]):
                     found.extend(
                         (code, (*path, "arguments"), message, warning)
                         for code, message, warning in self._check_call(item, connections[item["connection"]], False)
@@ -314,7 +305,7 @@ class SparkRules(JobRules):
                 sql = item.get("sql")
                 if isinstance(sql, str):
                     declared = set((job.get("spec") or {}).get("config") or {})
-                    for parameter in _PARAMETER.findall(_QUOTED.sub("''", sql)):
+                    for parameter in sql_parameters(sql):
                         if parameter not in declared | {"batch_id", "batch_ts", "driver_host"}:
                             found.append(
                                 (
@@ -341,11 +332,40 @@ class SparkRules(JobRules):
                 )
         return found
 
+    def _check_templates(self, job, connections):
+        """
+        `{{ }}` constants Spark would pass on as written: any in `sql` (Spark SQL takes the :batch_id, :batch_ts and
+        :driver_host parameters), and an adapter's own tokens (e.g. a JDBC staging table's {{ uuid }}) anywhere but
+        the arguments of that adapter's steps and outputs.
+        """
+        adapter_only, found = self.builtin_references - _BUILTINS, []
+        places = [((section,), job.get(section), frozenset()) for section in ("connections", "runtime")]
+        for section in ("steps", "outputs"):
+            for index, item in enumerate(job.get(section) if isinstance(job.get(section), list) else ()):
+                if isinstance(item, dict):
+                    connection = connections.get(item.get("connection"))
+                    adapter = self.adapters.get(connection.get("provider")) if isinstance(connection, dict) else None
+                    own = frozenset(adapter.template_tokens()) if adapter else frozenset()
+                    places.extend(((section, index, key), value, own if key == "arguments" else frozenset())
+                                  for key, value in item.items())
+        for path, value, own in places:
+            for expr in (expr for text in walk_strings(value) for expr in references(text)):
+                if path[-1] == "sql" and expr in self.builtin_references:
+                    found.append(("unrendered-reference", path, "{{ %s }} is not rendered in sql: use the :batch_id, "
+                                  ":batch_ts or :driver_host parameter" % expr, False))
+                elif expr in adapter_only and expr not in own:
+                    found.append(("unsupported-reference", path, "{{ %s }} is rendered only in the arguments of the "
+                                  "adapters that declare it (%s)" % (expr, ", ".join(sorted(
+                                      name for name, adapter in self.adapters.items()
+                                      if expr in adapter.template_tokens()))), False))
+        return found
+
     def check_engine(self, job):
         connections = job.get("connections") if isinstance(job.get("connections"), dict) else {}
         return (
             self._check_items(job, connections)
             + self._check_connections(connections)
             + check_runtime(job)
+            + self._check_templates(job, connections)
             + check_platform(job, self.launchers)
         )

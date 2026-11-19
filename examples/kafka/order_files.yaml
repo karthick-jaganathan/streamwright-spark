@@ -170,14 +170,15 @@ steps:
   # ============================================================================
   - name: file_arrivals
     connection: bus
-    service: message
-    method: consume
-    arguments:
-      destination: lake.s3_file_events.v1
-      group_id: streamwright-s3-events-to-delta
-      from: earliest
-      max_messages: 500
-      max_wait: 10s
+    operation:
+      service: message
+      method: consume
+      arguments:
+        destination: lake.s3_file_events.v1
+        group_id: streamwright-s3-events-to-delta
+        from: earliest
+        max_messages: 500
+        max_wait: 10s
 
   # ============================================================================
   # STEP 2: Extract file URIs and client metadata from message payload
@@ -223,20 +224,21 @@ steps:
   # ============================================================================
   - name: file_contents
     connection: landing
-    service: object
-    method: read
-    arguments:
-      path: "{{ distinct_files.file_uri }}"
-      format: csv
-      schema_mode: by_name
-      row_index: "row_id"                       # Lazy per-file record numbering (zero Catalyst window shuffle)
-      column_groups:
-        - name: metrics
-          glob: "metric_*"
-          type: double
-          strip_prefix: "metric_"
-      options:
-        header: true
+    operation:
+      service: object
+      method: read
+      arguments:
+        path: "{{ distinct_files.file_uri }}"
+        format: csv
+        schema_mode: by_name
+        row_index: "row_id"                       # Lazy per-file record numbering (zero Catalyst window shuffle)
+        column_groups:
+          - name: metrics
+            glob: "metric_*"
+            type: double
+            strip_prefix: "metric_"
+        options:
+          header: true
 
   # ============================================================================
   # STEP 5: Business Transformation & Lineage Checkpointing
@@ -303,14 +305,15 @@ outputs:
   # ============================================================================
   - name: bookkeeping_files_received
     connection: reporting_db
-    service: database
-    method: write
-    arguments:
-      mode: merge
-      table: reporting.file_event_audit
-      primary_key: [file_uri]
-      update: [client_id, status, batch_id, received_at]
-      staging_table: reporting.file_event_audit_stg
+    operation:
+      service: database
+      method: write
+      arguments:
+        mode: merge
+        table: reporting.file_event_audit
+        primary_key: [file_uri]
+        update: [client_id, status, batch_id, received_at]
+        staging_table: reporting.file_event_audit_stg
     sql: |
       SELECT
         file_uri,
@@ -335,32 +338,33 @@ outputs:
   # ============================================================================
   - name: delta_orders_merge
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3://{{ config.lake_bucket }}/delta/orders"
-      table_name: orders
-      partition_by: [event_date]
-      table_properties:
-        "delta.autoOptimize.optimizeWrite": "true"
-        "delta.autoOptimize.autoCompact": "true"
-      comment: "Consolidated e-commerce orders lakehouse table"
-      condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
-      target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
-      when_matched:
-        - action: update
-          set:
-            item_name: source.item_name
-            amount: source.amount
-            tax: source.tax
-            total_amount: source.total_amount
-            event_ts: source.event_ts
-            metrics: source.metrics
-            source_file: source.source_file
-            batch_id: source.batch_id
-      when_not_matched: [{action: insert}]
-      schema_evolution: add_columns
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3://{{ config.lake_bucket }}/delta/orders"
+        table_name: orders
+        partition_by: [event_date]
+        table_properties:
+          "delta.autoOptimize.optimizeWrite": "true"
+          "delta.autoOptimize.autoCompact": "true"
+        comment: "Consolidated e-commerce orders lakehouse table"
+        condition: "target.order_id = source.order_id AND target.client_id = source.client_id"
+        target_predicate: "target.event_date IN ({{ processed_orders.event_date }})"
+        when_matched:
+          - action: update
+            set:
+              item_name: source.item_name
+              amount: source.amount
+              tax: source.tax
+              total_amount: source.total_amount
+              event_ts: source.event_ts
+              metrics: source.metrics
+              source_file: source.source_file
+              batch_id: source.batch_id
+        when_not_matched: [{action: insert}]
+        schema_evolution: add_columns
     sql: "SELECT * FROM processed_orders"
 
   # ============================================================================
@@ -372,20 +376,21 @@ outputs:
   # ============================================================================
   - name: client_exports
     connection: lake
-    service: object
-    method: write
-    arguments:
-      path: "s3://{{ config.lake_bucket }}/exports/orders/"
-      format: csv
-      mode: overwrite
-      on_exists: overwrite
-      options:
-        header: true
-        compression: gzip
-      split_by: [client_id, event_date]
-      layout: "{client_id}/dt={event_date:%Y-%m-%d}"
-      file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
-      max_splits: 500
+    operation:
+      service: object
+      method: write
+      arguments:
+        path: "s3://{{ config.lake_bucket }}/exports/orders/"
+        format: csv
+        mode: overwrite
+        on_exists: overwrite
+        options:
+          header: true
+          compression: gzip
+        split_by: [client_id, event_date]
+        layout: "{client_id}/dt={event_date:%Y-%m-%d}"
+        file_name: "{client_id}_{event_date:%Y%m%d}_orders_{today}.csv.gz"
+        max_splits: 500
     sql: |
       SELECT client_id, event_date, event_ts, order_id, item_name, amount, tax, total_amount
       FROM processed_orders
@@ -411,14 +416,15 @@ outputs:
   # ============================================================================
   - name: bookkeeping_files_completed
     connection: reporting_db
-    service: database
-    method: write
-    arguments:
-      mode: merge
-      table: reporting.file_event_audit
-      primary_key: [file_uri]
-      update: [batch_id, status, rows_written, delta_version, completed_at]
-      staging_table: reporting.file_event_audit_stg
+    operation:
+      service: database
+      method: write
+      arguments:
+        mode: merge
+        table: reporting.file_event_audit
+        primary_key: [file_uri]
+        update: [batch_id, status, rows_written, delta_version, completed_at]
+        staging_table: reporting.file_event_audit_stg
     sql: |
       SELECT
         f.file_uri,
@@ -448,11 +454,12 @@ outputs:
   # ============================================================================
   - name: announce_batch_done
     connection: bus
-    service: message
-    method: publish
-    arguments:
-      destination: lake.orders.committed.v1
-      key: table_name
+    operation:
+      service: message
+      method: publish
+      arguments:
+        destination: lake.orders.committed.v1
+        key: table_name
     sql: |
       SELECT
         output,

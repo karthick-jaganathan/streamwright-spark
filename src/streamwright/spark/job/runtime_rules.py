@@ -22,16 +22,22 @@ import re
 
 from streamwright.core.jobs.refs import references
 from streamwright.spark.contracts import LAUNCHER_OWNED_CONF
+from streamwright.spark.job.vocabulary import LIMITS
 
 __all__ = ["check_platform", "check_runtime"]
 
 
 def check_runtime(job):
-    """Problems with `runtime`: required, the bookkeeping connection, `env` names/values and `spark.conf` keys."""
+    """
+    Problems with `runtime`: required, the bookkeeping connection, `limits` keys, `env` names/values and `spark.conf`
+    keys.
+    """
     runtime = job.get("runtime")
     if not isinstance(runtime, dict):
         return [("missing-runtime", ("runtime",), "runtime is required", False)]
-    found = []
+    limits = runtime.get("limits") if isinstance(runtime.get("limits"), dict) else {}
+    found = [("unsupported-key", ("runtime", "limits", str(key)), "the Spark engine has no runtime.limits.%s (keys: %s)"
+              % (key, ", ".join(sorted(LIMITS))), False) for key in limits if key not in LIMITS]
     state = runtime.get("state") if isinstance(runtime.get("state"), dict) else {}
     if state.get("connection"):
         for index, output in enumerate(job.get("outputs") or ()):

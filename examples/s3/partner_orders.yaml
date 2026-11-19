@@ -141,90 +141,91 @@ steps:
   # ============================================================================
   - name: harmonized_feed
     connection: landing_s3
-    service: object
-    method: read
-    arguments:
-      path:
-        - "s3://{{ config.landing_bucket }}/partners/alpha/alpha_orders_01.csv"
-        - "s3://{{ config.landing_bucket }}/partners/beta/beta_orders_01.tsv"
-        - "s3://{{ config.landing_bucket }}/partners/unknown/rejected_01.csv"
-      format: auto
-      path_pattern: "partners/(?P<partner>[^/]+)/"
-      on_unmapped_column: warn
-      on_mismatch: skip
-      row_errors: true
-      row_index: "row_id"
-      options:
-        header: true
+    operation:
+      service: object
+      method: read
+      arguments:
+        path:
+          - "s3://{{ config.landing_bucket }}/partners/alpha/alpha_orders_01.csv"
+          - "s3://{{ config.landing_bucket }}/partners/beta/beta_orders_01.tsv"
+          - "s3://{{ config.landing_bucket }}/partners/unknown/rejected_01.csv"
+        format: auto
+        path_pattern: "partners/(?P<partner>[^/]+)/"
+        on_unmapped_column: warn
+        on_mismatch: skip
+        row_errors: true
+        row_index: "row_id"
+        options:
+          header: true
 
-      # ------------------------------------------------------------------------
-      # Pattern-Based Dynamic Column Folding (NOT required in vocabulary)
-      # ------------------------------------------------------------------------
-      column_groups:
-        # Folds dynamic metric columns (e.g. fee_processing, metric_shipping) into MAP<STRING, DOUBLE>
-        - name: metrics
-          regex: "^(fee|metric)_[a-z0-9_]+$"
-          type: double
-          strip_prefix: "metric_"
+        # ------------------------------------------------------------------------
+        # Pattern-Based Dynamic Column Folding (NOT required in vocabulary)
+        # ------------------------------------------------------------------------
+        column_groups:
+          # Folds dynamic metric columns (e.g. fee_processing, metric_shipping) into MAP<STRING, DOUBLE>
+          - name: metrics
+            regex: "^(fee|metric)_[a-z0-9_]+$"
+            type: double
+            strip_prefix: "metric_"
 
-        # Folds dynamic partner attributes (e.g. attr_region, attr_channel) into MAP<STRING, STRING>
-        - name: extra_attributes
-          glob: "attr_*"
-          type: string
-          strip_prefix: "attr_"
+          # Folds dynamic partner attributes (e.g. attr_region, attr_channel) into MAP<STRING, STRING>
+          - name: extra_attributes
+            glob: "attr_*"
+            type: string
+            strip_prefix: "attr_"
 
-      # ------------------------------------------------------------------------
-      # Embedded Controlled Canonical Vocabulary
-      # ------------------------------------------------------------------------
-      vocabulary:
-        - {name: order_id,    type: bigint}
-        - {name: customer_id, type: string}
-        - {name: amount,      type: double}
-        - {name: currency,    type: string}
-        - {name: event_ts,    type: timestamp}
-        - {name: status,      type: string}
+        # ------------------------------------------------------------------------
+        # Embedded Controlled Canonical Vocabulary
+        # ------------------------------------------------------------------------
+        vocabulary:
+          - {name: order_id,    type: bigint}
+          - {name: customer_id, type: string}
+          - {name: amount,      type: double}
+          - {name: currency,    type: string}
+          - {name: event_ts,    type: timestamp}
+          - {name: status,      type: string}
 
-      # ------------------------------------------------------------------------
-      # Embedded Per-Partner Column Mapping Rules (Selected by extracted partner)
-      # ------------------------------------------------------------------------
-      columns:
-        by: partner
+        # ------------------------------------------------------------------------
+        # Embedded Per-Partner Column Mapping Rules (Selected by extracted partner)
+        # ------------------------------------------------------------------------
+        columns:
+          by: partner
 
-        # Partner Alpha (CSV): Order_Num, Cust_ID, AmountUSD, EventDate
-        # Uses regex: to match header casing variations (Order_Num, order_id, Order #)
-        alpha:
-          - regex: '(?i)^order[_\s]?(num|id|no)$'
-            canonical: "order_id"
-            type: "bigint"
-            required: true
-          - header: "Cust_ID"
-            canonical: "customer_id"
-            type: "string"
-          - header: "AmountUSD"
-            canonical: "amount"
-            type: "double"
-            required: true
-          - header: "EventDate"
-            canonical: "event_ts"
-            type: "timestamp"
+          # Partner Alpha (CSV): Order_Num, Cust_ID, AmountUSD, EventDate
+          # Uses regex: to match header casing variations (Order_Num, order_id, Order #)
+          alpha:
+            - regex: '(?i)^order[_\s]?(num|id|no)$'
+              canonical: "order_id"
+              type: "bigint"
+              required: true
+            - header: "Cust_ID"
+              canonical: "customer_id"
+              type: "string"
+            - header: "AmountUSD"
+              canonical: "amount"
+              type: "double"
+              required: true
+            - header: "EventDate"
+              canonical: "event_ts"
+              type: "timestamp"
 
-        # Partner Beta (TSV): transaction_id, client_key, total, timestamp
-        # Uses regex: to match transaction_id or txn_id variations
-        beta:
-          - regex: '(?i)^(transaction|txn)[_\s]?(id|num)$'
-            canonical: "order_id"
-            type: "bigint"
-            required: true
-          - header: "client_key"
-            canonical: "customer_id"
-            type: "string"
-          - header: "total"
-            canonical: "amount"
-            type: "double"
-            required: true
-          - header: "timestamp"
-            canonical: "event_ts"
-            type: "timestamp"
+          # Partner Beta (TSV): transaction_id, client_key, total, timestamp
+          # Uses regex: to match transaction_id or txn_id variations
+          beta:
+            - regex: '(?i)^(transaction|txn)[_\s]?(id|num)$'
+              canonical: "order_id"
+              type: "bigint"
+              required: true
+            - header: "client_key"
+              canonical: "customer_id"
+              type: "string"
+            - header: "total"
+              canonical: "amount"
+              type: "double"
+              required: true
+            - header: "timestamp"
+              canonical: "event_ts"
+              type: "timestamp"
 
   # ============================================================================
   # STEP 2: Business Transformation & Lineage Checkpoint
@@ -267,20 +268,21 @@ outputs:
   # ============================================================================
   - name: clean_orders_delta_merge
     connection: lake_delta
-    service: table
-    method: write
-    arguments:
-      mode: merge
-      path: "s3://{{ config.lake_bucket }}/delta/harmonized_orders"
-      table_name: harmonized_orders
-      partition_by: [event_date]
-      condition: "target.order_id = source.order_id"
-      target_predicate: "target.event_date IN ({{ harmonized_orders.event_date }})"
-      schema_evolution: add_columns
-      when_matched:
-        - action: update
-      when_not_matched:
-        - action: insert
+    operation:
+      service: table
+      method: write
+      arguments:
+        mode: merge
+        path: "s3://{{ config.lake_bucket }}/delta/harmonized_orders"
+        table_name: harmonized_orders
+        partition_by: [event_date]
+        condition: "target.order_id = source.order_id"
+        target_predicate: "target.event_date IN ({{ harmonized_orders.event_date }})"
+        schema_evolution: add_columns
+        when_matched:
+          - action: update
+        when_not_matched:
+          - action: insert
     sql: |
       SELECT
         order_id,
@@ -310,14 +312,15 @@ outputs:
   # ============================================================================
   - name: quarantine_corrupted_records
     connection: lake_s3
-    service: object
-    method: write
-    arguments:
-      path: "s3://{{ config.lake_bucket }}/quarantine/orders/"
-      layout: "dt={today:%Y-%m-%d}"
-      file_name: "batch_{batch_id}_quarantine.jsonl"
-      format: jsonl
-      mode: overwrite
+    operation:
+      service: object
+      method: write
+      arguments:
+        path: "s3://{{ config.lake_bucket }}/quarantine/orders/"
+        layout: "dt={today:%Y-%m-%d}"
+        file_name: "batch_{batch_id}_quarantine.jsonl"
+        format: jsonl
+        mode: overwrite
     sql: |
       SELECT
         order_id,
@@ -360,12 +363,13 @@ outputs:
   # ============================================================================
   - name: schema_drift_audit_log
     connection: audit_db
-    service: database
-    method: write
-    arguments:
-      table: audit.schema_drift_events
-      mode: merge
-      primary_key: [batch_id, step, file_uri]
+    operation:
+      service: database
+      method: write
+      arguments:
+        table: audit.schema_drift_events
+        mode: merge
+        primary_key: [batch_id, step, file_uri]
     sql: |
       SELECT
         step,
@@ -399,12 +403,13 @@ outputs:
   # ============================================================================
   - name: file_rejection_audit_log
     connection: audit_db
-    service: database
-    method: write
-    arguments:
-      table: audit.file_rejection_events
-      mode: merge
-      primary_key: [batch_id, step, file_uri]
+    operation:
+      service: database
+      method: write
+      arguments:
+        table: audit.file_rejection_events
+        mode: merge
+        primary_key: [batch_id, step, file_uri]
     sql: |
       SELECT
         step,
