@@ -72,6 +72,11 @@ def role_of(job, item, adapters):
     return operation.kind if operation and operation.kind in ("consume", "publish") else None
 
 
+def _reads_outside(item):
+    """A step that reads a connection or a source folder (not only earlier steps)."""
+    return bool(item.get("connection") or item.get("source"))
+
+
 def _reference_targets(item):
     found = []
 
@@ -115,7 +120,7 @@ def _annotate_nodes(plan):
         targets = [ref.partition(".") for ref in _reference_targets(node.item)]
         node.column_refs = [name for name, _, column in targets if column and name in by_name]
         node.row_refs = [name for name, _, column in targets if not column and name in by_name]
-        node.expensive = bool(node.item.get("connection")) or bool(_EXPENSIVE.search(node.item.get("sql") or ""))
+        node.expensive = _reads_outside(node.item) or bool(_EXPENSIVE.search(node.item.get("sql") or ""))
         node.persisted = bool(node.item.get("persist") or node.item.get("checkpoint"))
         node.pinned = False
         node.local = False
@@ -132,7 +137,7 @@ def _mark_local_steps(job, plan, adapters):
         node = by_name[name]
         if node.pinned:
             node.local = True
-        elif role_of(job, node.item, adapters) == "consume" or not node.item.get("connection"):
+        elif role_of(job, node.item, adapters) == "consume" or not _reads_outside(node.item):
             node.local = all(by_name[dependency].local for dependency in node.uses)
 
 

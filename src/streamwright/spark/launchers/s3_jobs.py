@@ -40,3 +40,37 @@ def read_s3(location, limit):
         ) from None
     except (OSError, UnicodeError) as exc:
         raise JobError("cannot read remote job: %s" % type(exc).__name__) from None
+
+
+def download_folder(location, target, limit):
+    """
+    The YAML files under the s3:// folder `location` (a source folder: source.yaml and streams/*.yaml) copied into
+    the local folder `target`, at most `limit` bytes in all. JobError when there are none or they are too large.
+    """
+    bucket, _, prefix = str(location)[5:].partition("/")
+    prefix = prefix.rstrip("/") + "/"
+    endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    client = boto3.client("s3", endpoint_url=endpoint) if endpoint else boto3.client("s3")
+    total, copied = 0, 0
+    try:
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            for item in page.get("Contents") or ():
+                relative = item["Key"][len(prefix):]
+                parts = relative.split("/")
+                if not relative.endswith((".yaml", ".yml")) or len(parts) > 2 or any(
+                        part in ("", ".", "..") for part in parts):
+                    continue                     # source.yaml and streams/<name>.yaml only, never outside `target`
+                total += item.get("Size") or 0
+                if total > limit:
+                    raise JobError("source folder %s is larger than %d bytes" % (location, limit))
+                path = os.path.join(target, *parts)
+                if not os.path.realpath(path).startswith(os.path.realpath(target) + os.sep):
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                client.download_file(bucket, item["Key"], path)
+                copied += 1
+    except ClientError as exc:
+        raise JobError("cannot read source folder %s: %s" % (
+            location, exc.response.get("Error", {}).get("Code", "ClientError"))) from None
+    if not copied:
+        raise JobError("source folder %s has no YAML files" % location)

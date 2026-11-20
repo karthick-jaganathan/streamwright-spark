@@ -25,7 +25,13 @@ from streamwright.core.jobs.apply.rules import check_apply, is_apply_output
 from streamwright.core.jobs.calls import call_problems, connection_problems, partition_problems
 from streamwright.core.jobs.check.rules import NAME_PATTERN, RESERVED_NAMES, input_field, install_hint
 from streamwright.core.jobs.fields import Field
-from streamwright.core.jobs.grammar import APPLY_FIELD, CONNECTION_GROUPS, OPERATION_FIELD, POLICY_FIELD
+from streamwright.core.jobs.grammar import (
+    APPLY_FIELD,
+    ASYNC_JOB_FIELD,
+    CONNECTION_GROUPS,
+    OPERATION_FIELD,
+    POLICY_FIELD,
+)
 from streamwright.core.jobs.locking import STATE_FIELDS
 from streamwright.core.jobs.log_labels import LOG_FIELD
 from streamwright.core.jobs.lookups.rules import FAN_OUT_FIELD, LOOKUPS_FIELD
@@ -72,8 +78,10 @@ class SparkRules(JobRules):
             "sql": ("name", "sql", "persist", "checkpoint", "view", LOG_KEY),
             "call": ("name", "connection", "service", "method", "arguments", "sql", "persist", "checkpoint", "view",
                      LOG_KEY),
-            "source_call": ("name", "connection", "service", "method", "arguments", "request", "partitions", "sql",
-                            "persist", "checkpoint", "view", LOG_KEY),
+            "source_call": ("name", "connection", "service", "method", "arguments", "request", "async_job",
+                            "partitions", "sql", "persist", "checkpoint", "view", LOG_KEY),
+            "source": ("name", "source", "stream", "config", "partitions", "sql", "persist", "checkpoint", "view",
+                       LOG_KEY),
         }
     )
 
@@ -133,8 +141,11 @@ class SparkRules(JobRules):
             spec=_object(config=Field("object", values=input_field()), secrets=Field("object", values=input_field()),
                          lookups=LOOKUPS_FIELD),
             connections=Field("object", required=True, min_items=1, values=connection),
-            steps=Field("array", items=Field("object", fields=dict(item, partitions=_CALL_FIELDS["partitions"],
-                                                                   log=STEP_LOG_FIELD))),
+            steps=Field("array", items=Field("object", fields=dict(
+                item, partitions=_CALL_FIELDS["partitions"], async_job=ASYNC_JOB_FIELD, log=STEP_LOG_FIELD,
+                source=Field("string", description="a StreamWright source folder (relative to the job's folder, "
+                                                   "local or remote)"),
+                stream=Field("string"), config=Field("object")))),
             outputs=Field(
                 "array",
                 required=True,
@@ -145,12 +156,20 @@ class SparkRules(JobRules):
         )
 
     def source_reference_keys_of(self, step, connections):
-        """A call step's `arguments` are rendered by the source engine too (`{{ partition.* }}`, windows)."""
-        if self.classify_step(step, connections)[0] == "source_call":
-            return self.source_reference_keys | {"arguments"}
+        """
+        A call step's `arguments` and `async_job` are rendered by the source engine too (`{{ partition.* }}`,
+        `{{ submit.* }}`), as is a source step's `config` (`{{ partition.* }}`).
+        """
+        kind = self.classify_step(step, connections)[0]
+        if kind == "source_call":
+            return self.source_reference_keys | {"arguments", "async_job"}
+        if kind == "source":
+            return self.source_reference_keys | {"config"}
         return self.source_reference_keys
 
     def classify_step(self, step, connections):
+        if "source" in step:
+            return "source", None                          # a source folder's stream, run on the driver
         if "connection" in step:
             conn = connections.get(step["connection"])
             provider = conn.get("provider") if isinstance(conn, dict) else None
@@ -165,6 +184,8 @@ class SparkRules(JobRules):
         """Execution-policy keys the Spark engine honours per step kind (contract v1.2 §6a)."""
         if kind == "source_call":
             return STEP_POLICY_KEYS                         # call steps throttle and page the connector
+        if kind == "source":
+            return ("retry", "page_size", "on_error", "timeout")   # the source folder owns its paging and throttle
         if kind == "sql":
             return ("on_error", "timeout")
         return ("retry", "on_error", "timeout")            # native reads/consumes: no client-side paging or throttle
@@ -239,10 +260,14 @@ class SparkRules(JobRules):
                 problems.append(("connector-not-installed",
                                  "provider %r has neither a Spark adapter nor an installed connector for calls: %s"
                                  % (provider, install_hint(provider)), False))
-            if "request" not in step and "service" not in step and "method" not in step:
-                problems.append(("missing-key", "a call step needs an `operation:`", False))
+            if not any(key in step for key in ("request", "service", "method", "async_job")):
+                problems.append(("missing-key", "a call step needs an `operation:` or an `async_job:`", False))
             elif provider in self.connectors:
                 problems += call_problems(step, connections[step["connection"]])
+            problems += partition_problems(step)
+        elif kind == "source":
+            if "stream" not in step:
+                problems.append(("missing-key", "a source step needs `stream`", False))
             problems += partition_problems(step)
         if step.get("persist") is not None and storage_level_name(step["persist"]) is None:
             problems.append(("bad-storage-level", "invalid Spark StorageLevel %r" % str(step["persist"]).strip(),

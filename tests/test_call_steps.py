@@ -20,13 +20,17 @@
 import dataclasses
 import importlib
 import json
+import os
+import sys
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
 from streamwright.core.jobs import Runner, WriteReceipt, calls
 from streamwright.core.jobs.apply.delivery import Applier, apply_calls
 from streamwright.core.jobs.grammar import to_internal
+from streamwright.core.jobs.manifest import JobError
 from streamwright.core.jobs.policy import TransientError
 from streamwright.core.jobs.state import open_sqlite
 from streamwright.core.runtime import components
@@ -36,6 +40,7 @@ from streamwright.core.sdk.contract import ConnectorDefinition, Field, Operation
 from streamwright.spark.cli.common import connections_of
 from streamwright.spark.cli.run import apply_connectors
 from streamwright.spark.contracts import Connection
+from streamwright.spark.engine import sources
 from streamwright.spark.engine.executor import SparkExecutor
 from streamwright.spark.job import validate
 from streamwright.spark.plan import build_plan
@@ -170,6 +175,152 @@ def test_a_source_call_step_loads_its_records_into_a_dataframe(fakesrc):
     assert [len(chunk) for chunk in spark.sparkContext.chunks] == [1, 1]   # loaded page_size records at a time
 
 
+class ReportSession(FakeSession):
+    """A report job: `submit` gives its id, `poll` its state (running, then done), `rows` the records."""
+    polls: ClassVar[list] = []
+
+    def read(self, operation, arguments, context):
+        if operation.method == "submit":
+            yield {"report": "r1"}
+        elif operation.method == "poll":
+            ReportSession.polls.append(arguments["report"])
+            yield {"state": "done" if len(ReportSession.polls) > 1 else "running"}
+        else:
+            yield [dict(record, report=arguments["report"]) for record in RECORDS]
+
+
+class ReportSourceAdapter(FakeSourceAdapter):
+    def open(self, connection, context):
+        return ReportSession()
+
+
+def test_a_call_step_runs_an_async_job_inline(monkeypatch):
+    report_ops = tuple(Operation(service="reports", method=method, kind=OperationKind.READ,
+                                 arguments=(Field("report", "string"),)) for method in ("submit", "poll", "rows"))
+    components.register(dataclasses.replace(CONNECTOR, operations=report_ops,
+                                            adapters={"source": "tests.test_call_steps:ReportSourceAdapter"}))
+    session = importlib.import_module("tests.test_call_steps").ReportSession   # the class the connector loads
+    session.polls.clear()
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    try:
+        job = _job()
+        job["steps"][0] = {"name": "rows", "connection": "src", "async_job": {
+            "submit": {"operation": {"service": "reports", "method": "submit"}},
+            "poll": {"operation": {"method": "poll", "arguments": {"report": "{{ submit.report }}"}},
+                     "every": "1s", "timeout": "1m", "done_when": {"path": "state", "equals": "done"}},
+            "results": {"operation": {"service": "reports", "method": "rows",
+                                      "arguments": {"report": "{{ submit.report }}"}}}}}
+        report = validate(job)
+        assert report.valid, [str(i) for i in report.issues if i.severity == "error"]
+        executor = SparkExecutor(FakeSpark(), {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={},
+                                 limits={}, declared_connections=_declared(), secrets={"tok": "secret-value"})
+        frame = executor._step(None, to_internal(job)["steps"][0])
+        assert [json.loads(line) for line in frame.lines] == [dict(record, report="r1") for record in RECORDS]
+        assert session.polls == ["r1", "r1"]
+    finally:
+        components.unregister("fakesrc")
+
+
+SOURCE_YAML = """\
+kind: source
+name: fake
+spec: {secrets: {tok: {type: string}}, config: {label: {type: string, default: none}}}
+auth: {provider: fakesrc, token: "{{ secrets.tok }}"}
+streams:
+  - name: items
+    requests: [{name: raw_items, operation: {service: data, method: list}}]
+    transform:
+      mode: page
+      steps:
+        - {name: items, select: "SELECT (record->>'id')::BIGINT AS id, record->>'name' AS name,
+                                         $label AS label FROM raw_items"}
+    export: {items: {step: items}}
+"""
+
+
+def _source_job(tmp_path, **step):
+    folder = tmp_path / "sources" / "fake"
+    folder.mkdir(parents=True)
+    (folder / "source.yaml").write_text(SOURCE_YAML)
+    job = _job()
+    job["steps"][0] = dict({"name": "rows", "source": "sources/fake", "stream": "items",
+                            "config": {"label": "{{ partition.label }}"},
+                            "partitions": [{"from": "labels", "field": "label"}]}, **step)
+    job["steps"].insert(0, {"name": "labels", "sql": "SELECT 'x' AS label"})
+    (tmp_path / "job.yaml").write_text(json.dumps(job))
+    return job
+
+
+def test_a_source_step_runs_its_stream_on_the_driver_once_per_partition(fakesrc, tmp_path):
+    job = _source_job(tmp_path)
+    report = validate(job)
+    assert report.valid, [str(i) for i in report.issues if i.severity == "error"]
+    executor = SparkExecutor(FakeSpark(), {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={}, limits={},
+                             declared_connections=_declared(), secrets={"tok": "secret-value"},
+                             job_location=str(tmp_path / "job.yaml"))
+    runtime = SimpleNamespace(values=lambda step, field: ["x"])
+    frame = executor._step(runtime, to_internal(job)["steps"][1])
+    assert [json.loads(line) for line in frame.lines] == [dict(record, label="x") for record in RECORDS]
+    assert list(executor.carry) == ['bookmarks:rows:{"label": "x"}']      # each scope resumes from its own
+
+
+def test_a_source_step_without_rows_keeps_its_export_columns(tmp_path, monkeypatch):
+    components.register(dataclasses.replace(CONNECTOR, adapters={"source": "tests.test_call_steps:EmptySourceAdapter"}))
+    try:
+        job = _source_job(tmp_path)
+        spark = FakeSpark()
+        created = []
+        monkeypatch.setattr(spark, "createDataFrame", lambda rows, schema=None: created.append(schema) or FakeFrame())
+        executor = SparkExecutor(spark, {"name": "ads", "steps": [], "outputs": []}, {}, {}, config={}, limits={},
+                                 declared_connections=_declared(), secrets={"tok": "secret-value"},
+                                 job_location=str(tmp_path / "job.yaml"))
+        executor._step(SimpleNamespace(values=lambda step, field: ["x"]), to_internal(job)["steps"][1])
+        assert created == ["`id` BIGINT, `name` STRING, `label` STRING"]
+    finally:
+        components.unregister("fakesrc")
+
+
+def test_a_relative_source_of_an_s3_manifest_is_downloaded_from_its_prefix(monkeypatch, tmp_path):
+    downloads = []
+    monkeypatch.setitem(sys.modules, "streamwright.spark.launchers.s3_jobs", SimpleNamespace(
+        download_folder=lambda location, target, limit: downloads.append(location)))
+    step = {"name": "rows", "source": "../sources/fake", "stream": "items"}
+    folder = sources.source_folder(step, "s3://code-bucket/jobs/ads/job.yaml")
+    assert downloads == ["s3://code-bucket/jobs/sources/fake"] and os.path.isdir(folder)
+    sources.source_folder(dict(step, source="s3://other/sources/fake"), None)
+    assert downloads[-1] == "s3://other/sources/fake"
+    with pytest.raises(JobError, match="outside the bucket"):
+        sources.source_folder(dict(step, source="../../../x"), "s3://code-bucket/jobs/job.yaml")
+    with pytest.raises(JobError, match="is not a folder"):
+        sources.source_folder(step, str(tmp_path / "job.yaml"))
+
+
+def test_a_remote_source_folder_copies_only_its_yaml_files_and_never_outside_the_target(monkeypatch, tmp_path):
+    keys = ["src/source.yaml", "src/streams/a.yaml", "src/streams/deep/b.yaml", "src/README.md", "src/../x.yaml",
+            "src/streams/../../y.yaml", "src//z.yaml"]
+    copied = []
+
+    class Client:
+        def get_paginator(self, name):
+            return SimpleNamespace(paginate=lambda **kwargs: [{"Contents": [{"Key": key, "Size": 10} for key in keys]}])
+
+        def download_file(self, bucket, key, path):
+            copied.append((key, os.path.relpath(path, str(tmp_path))))
+
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: Client()))
+    try:
+        reader = importlib.import_module("streamwright.spark.launchers.s3_jobs")   # bound to the fake boto3
+        reader.download_folder("s3://bucket/src", str(tmp_path), 1000)
+    finally:
+        sys.modules.pop("streamwright.spark.launchers.s3_jobs", None)       # other tests import it afresh
+    assert copied == [("src/source.yaml", "source.yaml"), ("src/streams/a.yaml", os.path.join("streams", "a.yaml"))]
+
+
+class EmptySourceAdapter(FakeSourceAdapter):
+    def open(self, connection, context):
+        return SimpleNamespace(read=lambda operation, arguments, context: iter([[]]), close=lambda: None)
+
+
 class PagedSession(FakeSession):
     pages = 0
 
@@ -195,7 +346,7 @@ def test_a_call_step_stops_collecting_once_past_runtime_limits_call_records(cap,
                                  secrets={"tok": "secret-value"})
         step = to_internal(_job())["steps"][0]
         if cap < 10_000:
-            with pytest.raises(ValueError, match=r"call step rows reached 151 records, more than "
+            with pytest.raises(ValueError, match=r"step rows reached 151 records, more than "
                                                  r"runtime\.limits\.call_records \(150\)"):
                 executor._step(None, step)
         else:

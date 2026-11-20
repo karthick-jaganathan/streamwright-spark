@@ -65,6 +65,63 @@ the records' own (inferred) columns:
     retry: {codes: [429, 503], max_attempts: 5}
 ```
 
+A call step may take `async_job:` instead of `operation:` (one or the other) to run a report job on the driver:
+`submit`, `poll` (`every`, `timeout`, `done_when`, `fail_when`) and exactly one of `results` or `download`, the
+grammar of a source request's `async_job` and of DuckDBJob's call steps (`get_engine_guide("DuckDBJob", "Call
+steps")`). Each part's `operation:` is a call (SDK connectors) or an HTTP request (REST connectors); its records reach
+`records` like a call's and count toward `call_records`. Call steps have no windows: set the range with
+`{{ config.* }}` or partitions.
+
+```yaml
+- name: report
+  connection: ads                   # provider: microsoft_ads
+  async_job:
+    submit:
+      operation:
+        service: ReportingService
+        method: SubmitGenerateReport
+        arguments:
+          request:
+            ReportRequest:
+              "@type": CampaignPerformanceReportRequest
+              Aggregation: Summary
+              Format: Csv
+              Columns: [AccountId, CampaignId, Impressions, Clicks, Spend]
+              Scope: {AccountIds: ["{{ config.account_id }}"]}
+              Time: {PredefinedTime: Last30Days}
+    poll:
+      operation: {method: PollGenerateReport, arguments: {request: {ReportRequestId: "{{ submit.result }}"}}}
+      every: 15s
+      timeout: 30m
+      done_when: {path: Status, equals: Success}
+      fail_when: {path: Status, equals: Error}
+    download: {url: "{{ poll.ReportDownloadUrl }}", format: csv, compression: zip}
+  sql: SELECT get_json_object(record, '$.CampaignId') AS campaign_id FROM records
+```
+
+## Source steps
+
+A `source:` + `stream:` step runs one stream of a StreamWright source folder on the driver, as a DuckDBJob's source
+step does: `{name, source, stream, config, partitions, sql}`. Use it for a report or sync that is already a source
+stream (incremental windows, lookback, bookmarks), or shared with other jobs.
+
+```yaml
+- name: performance
+  source: ../sources/microsoft_ads  # the source folder
+  stream: campaign_performance
+  config: {account_ids: ["{{ config.account_id }}"], customer_id: "{{ config.customer_id }}"}
+  sql: SELECT get_json_object(record, '$.campaign_id') AS campaign_id FROM records
+```
+
+- The rows are the stream's export rows: with `sql`, as the `record` JSON column of `records`; without, as their own
+  columns. A run without rows keeps the export's columns, so later steps still resolve them.
+- The records are collected on the driver, with call steps' cap (`runtime.limits.call_records`). Bookmarks are kept
+  per partition scope, so each scope resumes from its own.
+- `policy` takes `retry`, `page_size`, `on_error` and `timeout`; the source folder owns its paging and rate limit.
+- Where the folder is: a local path (a relative one starts at the job file's folder), or an `s3://` folder. When the
+  job manifest is itself an `s3://` URI, a relative path is resolved under the manifest's prefix (never outside its
+  bucket). The driver downloads an `s3://` folder's YAML files (`source.yaml`, `streams/*.yaml`), up to 5 MiB in all.
+
 ## Apply outputs (writes to a vendor API)
 
 An output whose connection is a connector (no Spark adapter) and whose `operation:` is one of its apply

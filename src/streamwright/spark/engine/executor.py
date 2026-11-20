@@ -34,6 +34,7 @@ from streamwright.core.jobs.step_log import StepLog, log_step_rows
 from streamwright.core.runtime.logs.context import log_context
 from streamwright.spark.engine.runtime import StepRuntime
 from streamwright.spark.engine.session import resolve_driver_host
+from streamwright.spark.engine.sources import empty_frame, source_folder
 from streamwright.spark.job.vocabulary import RECORDS_VIEW, limit, storage_level_name
 from streamwright.spark.plan import build_plan, role_of
 from streamwright.spark.sdk import SparkContext
@@ -71,13 +72,14 @@ def _tolerated(surface, name):
 
 class SparkExecutor:
     def __init__(self, spark, job, connections, adapters, *, config, limits, state=None, declared_connections=None,
-                 secrets=None, allowed_connectors=None, apply_outputs=(), redact=None):
+                 secrets=None, allowed_connectors=None, apply_outputs=(), redact=None, job_location=None):
         """`connections`: resolved by name; `adapters`: definition adapters by provider; `apply_outputs`: the outputs
         that apply connector operations (their rows go to the outbox, like publish outputs').
 
         `declared_connections` (as written, secret references kept), `secrets` and `allowed_connectors` are what
         source-connector call steps hand to the source engine on the driver (contract v1.2 §6a engine reach).
-        `redact` scrubs the lines of a step's `log:`.
+        `redact` scrubs the lines of a step's `log:`; `job_location` (the manifest's path or s3:// URI) is where a
+        relative `source:` folder is found.
         """
         self.spark, self.job, self.connections, self.adapters = spark, job, connections, adapters
         self.config, self.limits = config, limits
@@ -87,6 +89,8 @@ class SparkExecutor:
         self.allowed_connectors = allowed_connectors
         self.apply_outputs = frozenset(apply_outputs)
         self.redact = redact
+        self.job_location = job_location
+        self.source_folders = {}         # a `source:` step's folder, found (or downloaded) once per executor
         self.carry = {}
         self.plan = build_plan(job, adapters)
         self.pinned_steps = set(self.plan.pinned_steps)
@@ -222,6 +226,8 @@ class SparkExecutor:
     # --- steps and outputs -----------------------------------------------------------------------------------
 
     def _step(self, rt, step):
+        if step.get("source"):
+            return self._source_step(rt, step)            # a source folder's stream, run on the driver
         if not step.get("connection"):
             return self.spark.sql(step["sql"], args=self.params)
         if self.connections.get(step["connection"]) is None:
@@ -239,12 +245,33 @@ class SparkExecutor:
         return frame
 
     def _source_call(self, runtime, step):
+        """A call step: its records (a source connector run on the driver), as DuckDBJob's call step has them."""
+        return self._records_frame(self._record_lines(self._capped(self._call_records(runtime, step), step), step),
+                                   step)
+
+    def _source_step(self, runtime, step):
         """
-        A call step: its records (a source connector run on the driver), as DuckDBJob's call step has them. With `sql`,
-        the step is that query over `records` (one `record` column, the JSON text of each record: a stable schema
-        however many records came); without, the records' own columns (inferred, `record` when there are none).
+        A `source:` step: its stream's export rows (the source engine on the driver, once per partition scope), as
+        DuckDBJob's source step has them; no rows keep the export's columns, so later steps still resolve them.
         """
-        lines = self._record_lines(self._capped(self._call_records(runtime, step), step), step)
+        if step["source"] not in self.source_folders:
+            self.source_folders[step["source"]] = source_folder(step, self.job_location)
+        source, plan, columns = calls.source_step(self.source_folders[step["source"]], step.get("stream"))
+
+        def values(index, part):
+            return [value for value in runtime.values(part["from"], part["field"]) if value is not None]
+        records = calls.source_records(step, source, plan, calls.partition_scopes(step, values), carry=self.carry,
+                                       secrets=self.secrets, allowed_connectors=self.allowed_connectors)
+        lines = self._record_lines(self._capped(records, step), step)
+        if lines is None and columns and not step.get("sql"):
+            return empty_frame(self.spark, columns)
+        return self._records_frame(lines, step)
+
+    def _records_frame(self, lines, step):
+        """
+        A call or source step's frame: with `sql`, that query over `records` (one `record` column, the JSON text of
+        each record: a stable schema however many records came); without, the records' own columns.
+        """
         if not step.get("sql"):
             return self._empty_frame() if lines is None else self.spark.read.json(lines)
         records = (self._empty_frame() if lines is None
@@ -285,7 +312,7 @@ class SparkExecutor:
         try:
             for count, record in enumerate(records, 1):
                 if count > cap:
-                    raise ValueError("call step %s reached %d records, more than runtime.limits.call_records (%d)"
+                    raise ValueError("step %s reached %d records, more than runtime.limits.call_records (%d)"
                                      % (step["name"], count, cap))
                 yield record
         finally:

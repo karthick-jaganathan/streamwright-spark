@@ -367,6 +367,7 @@ def _drive_one(job, adapters, args, config, secrets, *, lock, outcome):
             spark, pinned_job, connections, adapters, config=pinned, limits=pinned_job["runtime"].get("limits"),
             state=store, declared_connections=(job.get("connections") or {}), secrets=secrets,
             allowed_connectors=getattr(args, "allow_connector", None), apply_outputs=applier.calls, redact=redact,
+            job_location=args.job,
         )
 
     consumer, publishers = _broker_calls(resolved, connections, adapters)

@@ -48,7 +48,19 @@ def _read_s3(location, limit):
     return reader.read_s3(location, limit)
 
 
+def _download_s3_folder(location, target, limit):
+    try:
+        reader = import_module("streamwright.spark.launchers.s3_jobs")
+    except ImportError as exc:
+        if exc.name not in ("boto3", "botocore"):
+            raise
+        raise JobError("reading remote source folders requires streamwright-spark[emr]") from None
+    reader.download_folder(location, target, limit)
+
+
 MANIFEST_READERS = MappingProxyType({"s3": _read_s3})
+# a remote `source:` folder's YAML files, copied into a local folder: (location, target, byte limit)
+FOLDER_READERS = MappingProxyType({"s3": _download_s3_folder})
 
 
 def resolve_job_location(path):
