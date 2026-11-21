@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/streamwright-spark.svg)](https://pypi.org/project/streamwright-spark/)
 [![Python](https://img.shields.io/pypi/pyversions/streamwright-spark.svg)](https://pypi.org/project/streamwright-spark/)
 [![License](https://img.shields.io/pypi/l/streamwright-spark.svg)](https://pypi.org/project/streamwright-spark/)
-[![Docs](https://img.shields.io/badge/docs-streamwright.web.app-brightgreen.svg)](https://streamwright.web.app/docs/spark/overview/)
+[![Docs](https://img.shields.io/badge/docs-streamwright.net-brightgreen.svg)](https://streamwright.net/docs/spark/overview/)
 
 `kind: SparkJob` for [StreamWright](https://pypi.org/project/streamwright/): declarative batch pipelines on Apache Spark.
 
@@ -57,5 +57,5 @@ sw spark run orders.yaml --once
 
 ## Links
 
-[Documentation](https://streamwright.web.app/docs/spark/overview/) ·
+[Documentation](https://streamwright.net/docs/spark/overview/) ·
 [StreamWright](https://github.com/karthick-jaganathan/streamwright)

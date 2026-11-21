@@ -29,8 +29,8 @@ requires-python = ">=3.11"
 dependencies = ["pyyaml==6.0.2", "sqlglot>=25", "streamwright~=0.1.17"]
 
 [project.urls]
-Homepage = "https://streamwright.web.app"
-Documentation = "https://streamwright.web.app/docs/"
+Homepage = "https://streamwright.net"
+Documentation = "https://streamwright.net/docs/"
 Repository = "https://github.com/karthick-jaganathan/streamwright-spark"
 "Issue Tracker" = "https://github.com/karthick-jaganathan/streamwright-spark/issues"
 
