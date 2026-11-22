@@ -30,7 +30,7 @@ dependencies = ["pyyaml==6.0.2", "sqlglot>=25", "streamwright~=0.1.17"]
 
 [project.urls]
 Homepage = "https://streamwright.net"
-Documentation = "https://streamwright.net/docs/"
+Documentation = "https://docs.streamwright.net/"
 Repository = "https://github.com/karthick-jaganathan/streamwright-spark"
 "Issue Tracker" = "https://github.com/karthick-jaganathan/streamwright-spark/issues"
 
