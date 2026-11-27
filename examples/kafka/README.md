@@ -82,9 +82,9 @@ An end-to-end, production-grade batch ingestion pipeline executed on **StreamWri
 - Client files often contain fluctuating extra metric columns (`metric_latency_ms`, `metric_discount_pct`).
 - Setting `column_groups:` folds wildcard columns (`glob: "metric_*"`) into a single `MAP<STRING, DOUBLE>` column (`metrics`), preventing schema pollution without requiring vocabulary changes.
 
-### 10. Multi-Secret Resolution (`runtime.secrets`)
-- Connects to AWS Secrets Manager via `mapping:` (for 1-secret-1-value plaintext or specific JSON key mapping) or `ids:` (multi-secret lists).
-- Resolves plaintext secrets or JSON key-value pairs without manual `--secrets` CLI flags.
+### 10. Multi-Secret Resolution (`spec.lookups`)
+- `ops_db_password` is bound to an `aws_secretsmanager` lookup: the driver fetches it without `--secrets`.
+- A plaintext secret gives its whole value; a JSON secret gives the key named by `field`.
 
 ### 11. Declarative Environment Mapping & Ephemeral EMR Targeting
 - `runtime.env:` injects non-secret variables into Spark driver/executor environments; `STREAMWRIGHT_SECRET_*` values stay on the driver and never enter Spark configuration.

@@ -326,27 +326,29 @@ Batch kafka_order_files-00000001 summary: 148 read, 2 rejected, 3 drifted, 4 dis
 
 ---
 
-## 9. Multi-Secret & Plaintext Resolution (`runtime.secrets:`)
+## 9. Multi-Secret & Plaintext Resolution (`spec.lookups`)
 
-Production pipelines often require multiple distinct secrets (e.g., separate database credentials for operational state stores and analytical reporting databases, or third-party API tokens). In AWS Secrets Manager, secrets are commonly provisioned either as **single-value raw plaintext strings** or as **JSON key-value dictionaries**.
-
-StreamWright handles both seamlessly under `runtime.secrets.aws_secretsmanager:`:
+Production pipelines often need several distinct secrets (an operational state store, a reporting database, API
+tokens). In AWS Secrets Manager a secret is either **one plaintext value** or **a JSON object of several values**.
+Declare the secrets in `spec.secrets` and bind each to an `aws_secretsmanager` lookup, which the driver runs itself:
 
 ```yaml
-runtime:
+spec:
   secrets:
-    aws_secretsmanager:
-      region: "us-east-1"
-      # Mapping declared secrets to specific AWS Secrets Manager Secret IDs / ARNs:
-      mapping:
-        ops_db_password: "prod/streamwright/ops_db"       # Resolved from raw plaintext or JSON {"ops_db_password": "..."}
-        audit_db_password: "prod/streamwright/audit_db"   # Resolved from raw plaintext or JSON {"audit_db_password": "..."}
-        pg_password: "prod/rds/credentials"               # Extracts JSON key "pg_password" if secret is JSON
+    ops_db_password:   {type: string, lookup: {from: ops_db}}                          # plaintext: the whole value
+    audit_db_password: {type: string, lookup: {from: audit_db}}
+    pg_password:       {type: string, lookup: {from: rds, field: pg_password}}         # one key of a JSON secret
+  lookups:
+    ops_db:   {type: aws_secretsmanager, secret_id: prod/streamwright/ops_db, region: us-east-1}
+    audit_db: {type: aws_secretsmanager, secret_id: prod/streamwright/audit_db, region: us-east-1}
+    rds:      {type: aws_secretsmanager, secret_id: prod/rds/credentials, region: us-east-1}
 ```
 
-- **Plaintext vs JSON Detection**: If the retrieved AWS Secret string begins with `{` and parses as valid JSON, StreamWright extracts the matching key. If it is raw plaintext (e.g. `supersecret123`), StreamWright assigns the full string directly.
-- **Multi-Secret Merging**: All resolved secrets are merged into a single dictionary accessible in Jinja expressions (`{{ secrets.ops_db_password }}`).
-- **Local Overrides**: For local testing, set `runtime.secrets: null` in your overlay, and StreamWright will automatically resolve `STREAMWRIGHT_SECRET_<NAME>` from your local environment variables.
+- **Plaintext or JSON**: without `field`, an input gets the secret's whole value; `field` picks one key (a dot path)
+  of a JSON secret. Nothing is merged in that you did not name.
+- **One fetch per secret**: a lookup runs once per run (per account with `runtime.fan_out` when it reads the item),
+  and every value is masked in logs, errors and state.
+- **Local overrides**: `--secrets FILE` or `STREAMWRIGHT_SECRET_<NAME>` win over a lookup, which then never runs.
 
 ---
 
@@ -370,7 +372,7 @@ During job launch, StreamWright maps non-secret variables to:
 3. `os.environ[<KEY>]` (on the driver)
 
 `STREAMWRIGHT_SECRET_*` values are resolved only on the driver and never copied into
-Spark configuration. Cluster drivers fetch them using `runtime.secrets`.
+Spark configuration. Cluster drivers get them through lookups (section 9).
 
 ### B. Resilient Cluster Targeting via CloudFormation (`stack_name:` / `stack_arn:`)
 In ephemeral cloud environments, EMR clusters are periodically terminated and reprovisioned by Infrastructure-as-Code (IaC) pipelines, causing physical cluster IDs (`j-XXXXXXXXXXXX`) to change.

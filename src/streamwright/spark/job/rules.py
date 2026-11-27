@@ -118,7 +118,6 @@ class SparkRules(JobRules):
             platform=Field("object"),
             limits=LIMITS_FIELD,
             env=Field("object"),
-            secrets=Field("object"),
             artifacts=Field("object"),
             fan_out=FAN_OUT_FIELD,
             log=LOG_FIELD,

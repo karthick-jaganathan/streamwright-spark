@@ -188,9 +188,10 @@ Every mapping decision, header signature, and file rejection is serialized into 
 - `STREAMWRIGHT_SECRET_*` values stay on the driver and are never copied into Spark configuration.
 - Avoids writing repetitive `--conf spark.yarn.appMasterEnv.X=...` and `--conf spark.executorEnv.X=...` flags.
 
-### 10. Multi-Secret & Plaintext Resolution (`runtime.secrets:`)
-- `mapping:` connects declared secret names (`audit_db_password`, `ops_db_password`) directly to individual AWS Secrets Manager IDs or ARNs.
-- Handles raw plaintext strings (e.g. `supersecret`) as well as multi-key JSON objects (`{"password": "..."}`) in a single resolution step.
+### 10. Multi-Secret & Plaintext Resolution (`spec.lookups`)
+- Each declared secret (`audit_db_password`, `ops_db_password`) is bound to an `aws_secretsmanager` lookup, which the driver runs itself.
+- A plaintext secret gives its whole value; a JSON secret gives the key named by `field` (`lookup: {from: registry, field: password}`).
+- `--secrets FILE` or `STREAMWRIGHT_SECRET_<NAME>` win locally, and the lookup then never runs.
 
 ### 11. Resilient EMR Cluster Targeting (`runtime.platform.cluster.stack_name:`)
 - Targets clusters dynamically by CloudFormation Stack Name or Stack ARN (`stack_name: "prod-data-platform-emr"`).

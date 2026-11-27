@@ -94,9 +94,14 @@ spec:
   config:
     kafka_bootstrap: {type: string}
     lake_bucket:     {type: string}
+  # Looked up in AWS Secrets Manager by the driver (spec.lookups below); --secrets or STREAMWRIGHT_SECRET_* win locally
   secrets:
-    ops_db_password:       {type: string}
-    reporting_db_password: {type: string}
+    ops_db_password:       {type: string, lookup: {from: ops_db}}     # a plaintext secret: its whole value
+    reporting_db_password: {type: string}                             # from --secrets or STREAMWRIGHT_SECRET_*
+  lookups:
+    ops_db: {type: aws_secretsmanager, secret_id: production/rds/ops_db_password, region: us-east-1}
+    # a JSON secret holding several values: one lookup, and `field` per input, e.g.
+    #   lookup: {from: lakehouse, field: reporting_db_password}
 
 connections:
   # ----------------------------------------------------------------------------
@@ -481,15 +486,6 @@ runtime:
   env:
     STREAMWRIGHT_SECRET_OPS: "{{ secrets.ops_db_password }}"
     AWS_DEFAULT_REGION: us-east-1
-
-  # AWS Secrets Manager Resolution:
-  # Supports 1-secret-1-value plaintext or specific JSON key mapping
-  secrets:
-    source: aws_secretsmanager
-    mapping:
-      ops_db_password: "production/rds/ops_db_password"
-      # Or multi-secret list:
-      # ids: ["production/lakehouse/secrets"]
 
   platform:
     type: local                                 # local | emr_ec2 | standalone

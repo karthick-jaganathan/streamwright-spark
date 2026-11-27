@@ -82,6 +82,24 @@ def check_runtime(job):
     return found
 
 
+def _cluster_secrets(job, environment):
+    """
+    On a cluster the driver has no --secrets file: a secret that runtime.env references must be bound to a lookup
+    (spec.secrets.NAME.lookup, such as an aws_secretsmanager lookup), which the driver resolves.
+    """
+    spec = job.get("spec") if isinstance(job.get("spec"), dict) else {}
+    declared = spec.get("secrets") if isinstance(spec.get("secrets"), dict) else {}
+    found = []
+    for key, value in environment.items():
+        for ref in references(value) if isinstance(value, str) else ():
+            name = ref[len("secrets."):] if ref.startswith("secrets.") else None
+            if name and not (isinstance(declared.get(name), dict) and declared[name].get("lookup")):
+                found.append(("secret-provider", ("runtime", "env", key),
+                              "secrets.%s: on a cluster the driver resolves secrets through lookups; bind it with "
+                              "spec.secrets.%s.lookup (e.g. an aws_secretsmanager lookup)" % (name, name), False))
+    return found
+
+
 def check_platform(job, launchers):
     """Problems with where the job runs: remote state paths, cluster secrets and its launcher (`launchers` None: not
     checked)."""
@@ -106,20 +124,8 @@ def check_platform(job, launchers):
                 False,
             )
         )
-    if platform.get("type") not in (None, "local") and any(
-        isinstance(value, str) and any(ref.startswith("secrets.") for ref in references(value))
-        for value in environment.values()
-    ):
-        secret_provider = runtime.get("secrets") if isinstance(runtime.get("secrets"), dict) else {}
-        if secret_provider.get("source") != "aws_secretsmanager":
-            found.append(
-                (
-                    "secret-provider",
-                    ("runtime", "secrets"),
-                    "cluster secrets require a driver-side secret provider",
-                    False,
-                )
-            )
+    if platform.get("type") not in (None, "local"):
+        found.extend(_cluster_secrets(job, environment))
     launcher = launchers.get(platform.get("type")) if launchers is not None else None
     if launchers is not None:
         if launcher is None:
