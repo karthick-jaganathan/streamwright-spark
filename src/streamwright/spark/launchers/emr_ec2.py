@@ -24,9 +24,10 @@ Cluster targeting:
     (with optional `logical_resource_id: "MyEMRCluster"`). The launcher dynamically queries CloudFormation to resolve
     the active physical cluster ID, making job submissions resilient across cluster recreations and stack updates.
 
-Secrets are never put in step arguments, the step environment or the lock: the driver fetches them itself
-(`runtime.secrets`). The Python environment archive named in the lock is shipped with --archives and selected with
-PYSPARK_PYTHON, so every autoscaled node localizes the same bytes. Job code is never installed by a bootstrap action.
+Secrets are never put in step arguments, the step environment or the lock: the driver looks them up itself
+(`spec.lookups`, e.g. aws_secretsmanager). The Python environment archive named in the lock is shipped with
+--archives and selected with PYSPARK_PYTHON, so every autoscaled node localizes the same bytes. Job code is never
+installed by a bootstrap action.
 """
 
 import os

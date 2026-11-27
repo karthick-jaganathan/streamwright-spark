@@ -192,3 +192,23 @@ def test_a_steps_log_is_checked_as_duckdbjob_checks_it(definition_adapter, log, 
     del job["steps"][0]["log"]
     job["outputs"][0]["log"] = {"message": "x"}
     assert [i.path for i in issues(job, definition_adapter)] == ["outputs[0].log"]
+
+
+def test_a_cluster_driver_gets_the_secrets_runtime_env_uses_from_lookups():
+    job = {"spec": {"secrets": {"audit": {"type": "string"},
+                                "ops": {"type": "string", "lookup": {"from": "aws_ops"}}},
+                    "lookups": {"aws_ops": {"type": "aws_secretsmanager", "secret_id": "prod/ops"}}},
+           "runtime": {"platform": {"type": "emr_ec2"},
+                       "env": {"STREAMWRIGHT_SECRET_AUDIT": "{{ secrets.audit }}", "OPS": "{{ secrets.ops }}"}}}
+    problems = [problem for problem in SparkRules({}).check_engine(job) if problem[0] == "secret-provider"]
+    assert problems == [("secret-provider", ("runtime", "env", "STREAMWRIGHT_SECRET_AUDIT"),
+                         "secrets.audit: on a cluster the driver resolves secrets through lookups; bind it with "
+                         "spec.secrets.audit.lookup (e.g. an aws_secretsmanager lookup)", False)]
+    local = dict(job, runtime=dict(job["runtime"], platform={"type": "local"}))  # --secrets reach a local driver
+    assert not [problem for problem in SparkRules({}).check_engine(local) if problem[0] == "secret-provider"]
+
+
+def test_runtime_secrets_is_no_longer_a_runtime_key(definition_adapter):
+    job = sample_job()
+    job["runtime"] = {"secrets": {"source": "aws_secretsmanager", "mapping": {"key": "prod/key"}}}
+    assert ("unknown-key", "runtime.secrets") in [(issue.code, issue.path) for issue in issues(job, definition_adapter)]

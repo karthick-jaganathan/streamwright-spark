@@ -155,7 +155,8 @@ def _spark_conf(job, extra_conf):
         key.startswith(("spark.yarn.appMasterEnv.STREAMWRIGHT_SECRET_", "spark.executorEnv.STREAMWRIGHT_SECRET_"))
         for key in conf
     ):
-        raise LaunchError("secret environment variables cannot be put in Spark conf; use runtime.secrets")
+        raise LaunchError("secret environment variables cannot be put in Spark conf; bind the secret to a lookup "
+                          "(spec.lookups), which the driver resolves")
     return conf
 
 
@@ -183,7 +184,8 @@ def _submit(job, args, lock, platform, launcher):
         _error(exc)
         return 2
     if getattr(args, "secrets", None):
-        _error("--secrets is not delivered to cluster drivers; use runtime.secrets")
+        _error("--secrets is not delivered to cluster drivers; bind the secrets to lookups (spec.lookups, e.g. "
+               "aws_secretsmanager), which the driver resolves")
         return 2
     flags = driver_flags(args)
     env = (lock or {}).get("python_env") or {}

@@ -54,11 +54,13 @@ spec:
   config:
     kafka_bootstrap: {type: string}
     lake_bucket:     {type: string}
-  # Secrets fetched securely by the driver using the instance profile / IAM role
+  # Secrets the driver looks up itself (instance profile / IAM role); --secrets or STREAMWRIGHT_SECRET_* win locally
   secrets:
-    ops_db_password:       {type: string}
-    config_db_password:    {type: string}
-    reporting_db_password: {type: string}
+    ops_db_password:       {type: string, lookup: {from: client_secrets, field: ops_db_password}}
+    config_db_password:    {type: string, lookup: {from: client_secrets, field: config_db_password}}
+    reporting_db_password: {type: string, lookup: {from: client_secrets, field: reporting_db_password}}
+  lookups:
+    client_secrets: {type: aws_secretsmanager, secret_id: streamwright/bronze_client_orders, region: us-east-1}
 
 connections:
   # ----------------------------------------------------------------------------
@@ -341,9 +343,6 @@ runtime:
   state:
     connection: ops_db
     schema: sw_ops
-  secrets:
-    source: aws_secretsmanager
-    id: streamwright/bronze_client_orders
   limits:
     reference_values: 10000
     read_groups: 200

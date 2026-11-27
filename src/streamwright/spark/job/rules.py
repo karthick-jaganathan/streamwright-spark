@@ -117,8 +117,9 @@ class SparkRules(JobRules):
             spark=_object(app_name=_TEXT, version=_TEXT, conf=Field("object")),
             platform=Field("object"),
             limits=LIMITS_FIELD,
-            env=Field("object"),
-            secrets=Field("object"),
+            env=Field("object", description="variables for the driver and executors; STREAMWRIGHT_SECRET_* stay on "
+                                             "the driver, and on a cluster a {{ secrets.NAME }} here needs "
+                                             "spec.secrets.NAME.lookup"),
             artifacts=Field("object"),
             fan_out=FAN_OUT_FIELD,
             log=LOG_FIELD,

@@ -70,9 +70,15 @@ spec:
   config:
     landing_bucket: {type: string}
     lake_bucket:    {type: string}
+  # Looked up in AWS Secrets Manager by the driver (spec.lookups below); --secrets or STREAMWRIGHT_SECRET_* win locally
   secrets:
-    audit_db_password:     {type: string}
-    ops_db_password:       {type: string}
+    audit_db_password:     {type: string, lookup: {from: audit_db}}     # a plaintext secret: its whole value
+    ops_db_password:       {type: string, lookup: {from: ops_db}}
+  lookups:
+    audit_db: {type: aws_secretsmanager, secret_id: production/rds/audit_db_password, region: us-east-1}
+    ops_db:   {type: aws_secretsmanager, secret_id: production/rds/ops_db_password, region: us-east-1}
+    # a JSON secret holding several values: one lookup, and `field` per input, e.g.
+    #   lookup: {from: partner_registry, field: audit_db_password}
 
 connections:
   # ----------------------------------------------------------------------------
@@ -429,16 +435,6 @@ runtime:
   env:
     STREAMWRIGHT_SECRET_AUDIT: "{{ secrets.audit_db_password }}"
     AWS_DEFAULT_REGION: us-east-1
-
-  # AWS Secrets Manager Resolution:
-  # Resolves multiple distinct secret IDs into job-level secrets
-  secrets:
-    source: aws_secretsmanager
-    mapping:
-      audit_db_password: "production/rds/audit_db_password"
-      ops_db_password: "production/rds/ops_db_password"
-      # Or multi-secret list:
-      # ids: ["production/partner_registry/secrets"]
 
   platform:
     type: local                                 # local | emr_ec2 | standalone
