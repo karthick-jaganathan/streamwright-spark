@@ -21,6 +21,13 @@ credential fields (or `runtime.env.STREAMWRIGHT_SECRET_*`); other values cannot
 interpolate secrets. Provide non-secret inputs with `--config` or `--set NAME=VALUE`.
 Configuration-derived JDBC host, database and port are checked again after resolution.
 
+Secrets come from `--secrets FILE` or `STREAMWRIGHT_SECRET_<NAME>` locally. A cluster driver gets
+neither: bind each secret it needs to a lookup (see Lookups and accounts), such as
+`db_password: {type: string, lookup: {from: db, field: password}}` with
+`spec.lookups.db: {type: aws_secretsmanager, secret_id: prod/database, region: us-east-1}`
+(without `field`: the whole value). On a remote platform, `validate` requires it for every
+secret `runtime.env` references (`secret-provider`). An explicit value wins over a lookup.
+
 ## Call steps (any source connector)
 
 A SparkJob reaches **every** connector (connector contract v1.2 §6a). A connector with a
