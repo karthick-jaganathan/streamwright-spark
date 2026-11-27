@@ -181,23 +181,17 @@ docker compose run --rm sw run /work/examples/kafka/order_files.yaml \
 Inspect batch progress, view audit receipts, or retry failed batches:
 
 ```bash
+# The job's state database (runtime.state: the local overlay's ops_db, schema sw_ops); no job manifest needed
+export STREAMWRIGHT_STATE_URL="postgresql://sw:$OPS_DB_PASSWORD@127.0.0.1:5432/streamwright?schema=sw_ops&sslmode=disable"
+
 # List recent batches
-sw spark state batches examples/kafka/order_files.yaml \
-  --overlay examples/kafka/order_files.local.yaml \
-  --set kafka_bootstrap=127.0.0.1:9094 \
-  --set lake_bucket=acme-lake
+sw state list --job kafka_order_files
 
 # View detailed batch manifest and write receipts
-sw spark state show examples/kafka/order_files.yaml kafka_order_files-00000001 \
-  --overlay examples/kafka/order_files.local.yaml \
-  --set kafka_bootstrap=127.0.0.1:9094 \
-  --set lake_bucket=acme-lake
+sw state show kafka_order_files-00000001
 
-# Queue a failed or interrupted batch for retry
-sw spark state retry examples/kafka/order_files.yaml kafka_order_files-00000001 \
-  --overlay examples/kafka/order_files.local.yaml \
-  --set kafka_bootstrap=127.0.0.1:9094 \
-  --set lake_bucket=acme-lake
+# Queue a failed or interrupted batch for retry (it resumes at the job's next run)
+sw state retry kafka_order_files-00000001
 ```
 
 #### Directly Querying the `sw_*` State Tables in PostgreSQL

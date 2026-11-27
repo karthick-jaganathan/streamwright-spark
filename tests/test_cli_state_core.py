@@ -15,60 +15,38 @@
 # * limitations under the License.
 # **************************************************************************/
 
-"""The Spark state CLI reads and manages the shared jobs store."""
+"""A SparkJob's batches are looked after by `streamwright state ... --url`, from the shared state tables alone."""
 
+import json
 from types import SimpleNamespace
 
-import pytest
-
+from streamwright.core.cli import main as core_main
 from streamwright.core.jobs import ExecutionResult, Runner
 from streamwright.core.jobs.state import open_sqlite
 from streamwright.spark.cli import state as state_cli
-from streamwright.spark.cli.main import main
 from streamwright.spark.job.rules import SparkRules
 
 
-def test_state_cli_uses_core_schema_and_batch_fields(monkeypatch, tmp_path, capsys):
-    store = open_sqlite(str(tmp_path / "spark-state.db"))
-    job = {
-        "name": "sparkjob",
-        "runtime": {"state": {"sqlite": str(tmp_path / "spark-state.db")}, "platform": {"type": "local"}},
-    }
-    monkeypatch.setattr(state_cli, "load_plugins", lambda allow: ({}, {}, []))
-    monkeypatch.setattr(state_cli, "load_job", lambda path, overlays: job)
-    monkeypatch.setattr(state_cli, "check_job", lambda job, adapters, launchers: ([], []))
-    monkeypatch.setattr(state_cli, "config_values", lambda job, args: {})
-    monkeypatch.setattr(state_cli, "provided_secrets", lambda job, args: {})
-    monkeypatch.setattr(state_cli, "resolve", lambda job, config, secrets: (job, []))
-
-    def open_store(job, connections, adapters, base_dir):
-        assert base_dir == str(tmp_path)
-        return store
-
-    monkeypatch.setattr(state_cli, "open_store", open_store)
-    job_path = str(tmp_path / "job.yaml")
-    assert main(["state", "migrate", job_path]) == 0
-    assert store.schema_version() >= 1
+def test_streamwright_state_reads_and_settles_a_spark_job_s_batches_without_the_job(tmp_path, capsys):
+    path = tmp_path / "spark-state.db"
+    store = open_sqlite(str(path))
+    store.initialize()
     assert (
         Runner("sparkjob", store, SimpleNamespace(execute=lambda ctx, manifest, done, hooks: ExecutionResult())).run()
         == 0
     )
+    url = "sqlite:///%s" % path
     capsys.readouterr()
-    assert main(["state", "list", job_path]) == 0
-    out = capsys.readouterr().out
-    assert "sparkjob-00000001" in out and "completed" in out
-    assert main(["state", "show", "--job", job_path, "sparkjob-00000001"]) == 0
-    assert '"job_id": "sparkjob-00000001"' in (shown := capsys.readouterr().out) and '"sequence": 1' in shown
-    assert main(["state", "leases", job_path]) == 0
+    assert core_main(["state", "list", "--url", url, "--json"]) == 0
+    (listed,) = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert (listed["job"], listed["job_id"], listed["status"]) == ("sparkjob", "sparkjob-00000001", "completed")
+    assert core_main(["state", "show", "--url", url, "sparkjob-00000001"]) == 0
+    assert json.loads(capsys.readouterr().out)["sequence"] == 1
+    assert core_main(["state", "leases", "--url", url, "--job", "sparkjob"]) == 0
     assert "<job>" in capsys.readouterr().out
-    assert main(["state", "purge", job_path, "--older-than", "30"]) == 0   # the age in days
-    assert "purged 0" in capsys.readouterr().out
-    assert main(["state", "purge", job_path, "--older-than", "0s"]) == 0
+    assert core_main(["state", "purge", "--url", url, "--job", "sparkjob", "--older-than", "0s"]) == 0
     assert "purged 1" in capsys.readouterr().out
-    assert main(["state", "check", job_path]) == 0
-    with pytest.raises(SystemExit) as usage:                               # only retry, which runs the job, logs
-        main(["state", "list", job_path, "--log-level", "DEBUG"])
-    assert usage.value.code == 2
+    assert core_main(["state", "check", "--url", url]) == 0
 
 
 def test_sqlite_state_resolves_relative_to_job_directory_not_current_directory(tmp_path, monkeypatch):

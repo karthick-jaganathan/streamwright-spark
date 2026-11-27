@@ -65,7 +65,7 @@ connections:
 
 runtime:
   # A test environment: let the run create or upgrade the state tables (production applies them with
-  # `sw spark state migrate JOB` and runs without this)
+  # `streamwright state migrate --url URL` and runs without this)
   state:
     apply_migrations: true
   secrets: null

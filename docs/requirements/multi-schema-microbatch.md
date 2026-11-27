@@ -197,7 +197,7 @@ Keep the existing five messages and add (new files under `acme-landing`):
 | `clientE/events.parquet` and `clientE/events.csv` in one message batch | two formats | both read (R2); a mapping for clientE is added to `docker/postgres-init.sql` |
 
 The acceptance run: `make down && make up && make seed-order-files`, then the documented `docker compose run --rm sw run ... --drain`;
-afterwards `sw spark state show` shows one completed batch and the report outputs contain the rows above. Report any
+afterwards `sw state show --url URL JOB_ID` shows one completed batch and the report outputs contain the rows above. Report any
 deviation; do not adjust the expectations to match the output without saying so.
 
 ## 7. Open questions (defaults to use if nobody answers)

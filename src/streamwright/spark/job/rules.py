@@ -23,7 +23,7 @@ from streamwright.core.jobs import JobRules
 from streamwright.core.jobs.apply.log import OUTPUT_LOG_FIELD
 from streamwright.core.jobs.apply.rules import check_apply, is_apply_output
 from streamwright.core.jobs.calls import call_problems, connection_problems, partition_problems
-from streamwright.core.jobs.check.rules import NAME_PATTERN, RESERVED_NAMES, input_field, install_hint
+from streamwright.core.jobs.check.rules import JOB_NAME_PATTERN, NAME_PATTERN, RESERVED_NAMES, input_field, install_hint
 from streamwright.core.jobs.fields import Field
 from streamwright.core.jobs.grammar import (
     APPLY_FIELD,
@@ -136,7 +136,7 @@ class SparkRules(JobRules):
         return _object(
             kind=Field("string", required=True, enum=("SparkJob",)),
             version=Field(("integer", "string")),
-            name=Field("string", required=True, pattern=NAME_PATTERN),
+            name=Field("string", required=True, pattern=JOB_NAME_PATTERN),
             description=_TEXT,
             spec=_object(config=Field("object", values=input_field()), secrets=Field("object", values=input_field()),
                          lookups=LOOKUPS_FIELD),

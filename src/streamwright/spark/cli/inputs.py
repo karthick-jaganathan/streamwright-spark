@@ -23,8 +23,7 @@ from streamwright.core.config import inputs as core_inputs
 from streamwright.core.jobs import inputs as job_inputs
 from streamwright.spark.cli.common import err, parse_set
 
-__all__ = ["InputError", "config_values", "provided_config", "provided_secrets", "secret_values",
-           "state_secret_values"]
+__all__ = ["InputError", "config_values", "provided_config", "provided_secrets", "secret_values"]
 
 InputError = core_inputs.InputError
 
@@ -50,11 +49,6 @@ def provided_secrets(job, args):
 def secret_values(job, args):
     """STREAMWRIGHT_SECRET_<NAME> variables, --secrets FILE, or runtime.secrets (AWS Secrets Manager); never printed."""
     return job_inputs.secret_values(job, _provided_secrets(job, args))
-
-
-def state_secret_values(job, args):
-    """Only the secrets runtime.state's connection needs (the others stay references): for `sw spark state`."""
-    return job_inputs.state_secrets(job, _provided_secrets(job, args))
 
 
 def _provided_secrets(job, args):
