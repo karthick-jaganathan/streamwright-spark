@@ -6,13 +6,14 @@ platforms are **local**, **standalone**, and **emr_ec2** (install the `emr` extr
 ## Pipeline
 
 Declare `kind: SparkJob`, `name`, `spec.config`/`spec.secrets`, `connections`,
-`steps`, `outputs`, and `runtime`. Steps create lazy DataFrames and views; outputs
+`steps`, `outputs`, and `runtime`. `name` may have dotted parts (`s3.orders_export`); step, output
+and connection names have none. Steps create lazy DataFrames and views; outputs
 trigger writes. The core Runner acquires a fenced lease, pins input messages and
 reference values, records output receipts, commits the outbox atomically, acknowledges
 messages, then publishes outbox events. A failed batch is dealt with by its scope's next
 run (`runtime.state.failed_job_policy`): `abandon` (default) gives it up, `retry` resumes it
-(up to `max_job_attempts`, default 3), `block` stops the scope until `state retry` or
-`state abandon` (see State, scopes and locks); Delta append replays check their
+(up to `max_job_attempts`, default 3), `block` stops the scope until `streamwright state retry` or
+`abandon` (see State, scopes and locks); Delta append replays check their
 transaction log before writing.
 
 Connection credentials must use `{{ secrets.NAME }}` only in the adapter's declared
@@ -132,9 +133,9 @@ to the vendor, one operation per row (`sql` gives the rows; they are collected o
 allow_remove}`, `policy: {retry, rate_limit}` and `log: {sql, message, level, max_rows}` (once the rows are sent, a
 line per row of a SELECT over the output's results: its columns and `outcome.status|error_code|error_message|result|row`);
 rows are committed to the outbox with the batch, each chunk is marked in flight
-before its call and every row's outcome kept (`sw spark state show JOB JOB_ID`). A call cut short is sent again for
-an idempotent operation, else held until `sw spark state resend|skip JOB JOB_ID` (MCP: `get_engine_guide("duckdb",
-"Apply outputs")` has the details).
+before its call and every row's outcome kept (`streamwright state show --url URL JOB_ID`). A call cut short is sent
+again for an idempotent operation, else held until `streamwright state resend|skip --url URL JOB_ID` (MCP:
+`get_engine_guide("duckdb", "Apply outputs")` has the details).
 
 ## File names
 
@@ -212,12 +213,12 @@ platforms) or `connection: NAME` of a PostgreSQL or MySQL connection (`schema`, 
 `ttl_seconds`, `scope`, `lock`, `job_key`, `failed_job_policy` (what the next run does with
 a failed batch: `abandon`, the default, gives it up, its error kept, and runs on; `retry`
 resumes it from where it failed, with its pinned inputs, while it has been started fewer
-than `max_job_attempts` times, default 3, then stops; `block` stops until `state retry` or
-`state abandon`; an abandoned batch keeps its `job_key`, so use `retry` for keyed jobs) and
+than `max_job_attempts` times, default 3, then stops; `block` stops until `streamwright state retry` or
+`abandon`; an abandoned batch keeps its `job_key`, so use `retry` for keyed jobs) and
 `apply_migrations`. The tables are the `sw_*`
 tables of every engine. A run (and a state action) only checks them and fails (exit 1)
-while a migration is pending: a deployment applies them with `sw spark state migrate JOB`
-or `streamwright state migrate --url URL`; `run --apply-state-migrations` (forwarded to a
+while a migration is pending: a deployment applies them with
+`streamwright state migrate --url URL`; `run --apply-state-migrations` (forwarded to a
 cluster driver) or `apply_migrations: true` (a local overlay) let a run apply them itself. `scope` and `lock` mean what they mean for a
 DuckDBJob (`get_engine_guide("DuckDBJob", "State, scopes and locks")` has the full rules):
 
@@ -245,13 +246,13 @@ runtime:
   paths with `{{ batch.id }}` or the scope's config value, so scopes never overwrite each
   other's files. Delta `txnAppId` is
   `<job>:<output>:<store id>[:<scope>]`.
-- `sw spark state` has the DuckDBJob state actions: `list JOB [--scope TEXT] [--limit N]
-  [--json]` (sequence, scope, rows, Spark app and host per batch), `status`, `show JOB JOB_ID`
-  (pinned inputs, tokens, rows, receipts), `retry JOB JOB_ID` (resumes at the next run),
-  `abandon JOB JOB_ID`, `leases`, `purge JOB --older-than 30d`, `migrate [--dry-run]`, `check`.
-  retry and abandon take the batch's tokens (they fail while a run of its scope holds them).
-  Every action takes `JOB [--overlay F] [--config F] [--set K=V] [--secrets F]` (only the
-  state connection's secrets) and its own options.
+- A SparkJob's batches are looked after like any job's, from its state database alone: `streamwright
+  state ACTION --url URL` (the `runtime.state` database: `sqlite:///...`, or the connection's
+  `postgresql://` / `mysql://` URL; no job manifest, no config). `list [--job NAME] [--scope TEXT]
+  [--status S] [--request-id ID] [--json]`, `show JOB_ID` (pinned inputs, tokens, rows, receipts,
+  outbox), `retry JOB_ID` (resumes at the next run), `abandon JOB_ID`, `resend|skip JOB_ID`,
+  `leases --job NAME`, `purge --job NAME --older-than 30d`, `migrate [--dry-run]`, `check`. retry,
+  abandon, resend and skip take the batch's tokens (they fail while a run of its scope holds them).
 
 ## Commands
 
@@ -261,15 +262,15 @@ runtime:
   [--state-lock-policy fail|wait|prune] [--state-lock-timeout 5m] [--summary [FILE]]
   [--failed-job-policy abandon|retry|block] [--max-job-attempts N] [--apply-state-migrations]
   [--log-level LEVEL] [--log NAME=LEVEL] [--spark-log-level WARN]
-  [--dry-run] [--detach]`: a run only checks the state tables (`sw spark state migrate JOB`
-  creates them; `--apply-state-migrations` lets the run do it);
+  [--dry-run] [--detach]`: a run only checks the state tables (`streamwright state migrate --url
+  URL` creates them; `--apply-state-migrations` lets the run do it);
   `--log-level`/`--log`/`--log-format` set streamwright's loggers (as on every command),
   `--spark-log-level` the JVM's; `--interval` needs `--follow`, `--detach` a remote platform;
   `--summary` writes the run's JSON summary (status `ok`, `skipped` or `failed`) on the driver.
 * `sw spark lock JOB --spark VERSION [--check]` (the dependency lock file, checked by
   `run --lock F` / `--lock-required`; not `runtime.state.lock`): `--check` verifies the
   installed versions and that the lock still pins what the job's connectors need
-* `sw spark state ACTION JOB` (see State, scopes and locks)
+* `streamwright state ACTION --url URL`: the job's batches (see State, scopes and locks)
 
 Every option, live: `sw spark <command> --help` (MCP: `get_cli_reference("spark run")`).
 

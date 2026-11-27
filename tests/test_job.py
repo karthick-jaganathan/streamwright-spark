@@ -71,6 +71,14 @@ def test_spark_rules_accept_valid_job_and_reject_misplaced_secret(definition_ada
     assert any(issue.code == "literal-secret" for issue in issues(job, definition_adapter))
 
 
+def test_a_spark_jobs_name_may_have_dotted_parts(definition_adapter):
+    job = sample_job()
+    job["name"] = "s3.orders_export"
+    assert issues(job, definition_adapter) == []
+    job["name"] = "s3..orders"
+    assert [(issue.code, issue.path) for issue in issues(job, definition_adapter)] == [("bad-value", "name")]
+
+
 def test_shared_checker_flags_cycles_and_unknown_parameters(definition_adapter):
     job = sample_job()
     job["steps"] = [{"name": "first", "sql": "SELECT * FROM second"}, {"name": "second", "sql": "SELECT * FROM first"}]

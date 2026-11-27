@@ -138,9 +138,9 @@ def test_spark_command_is_registered_through_core_plugin_group(monkeypatch, caps
 
     monkeypatch.setattr(plugins, "entry_point_source", lambda: {plugins.COMMANDS: [CommandEntry()]})
     with pytest.raises(SystemExit) as exited:
-        core_main(["spark", "state", "--help"])
+        core_main(["spark", "run", "--help"])
     assert exited.value.code == 0
-    assert "migrate" in capsys.readouterr().out
+    assert "runtime.state" in capsys.readouterr().out
     with pytest.raises(SystemExit) as exited:
         core_main(["spark", "--help"])
     assert exited.value.code == 0

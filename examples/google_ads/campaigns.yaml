@@ -114,7 +114,7 @@ outputs:
 runtime:
   state:
     sqlite: /var/lib/streamwright/google_ads_campaigns.db
-    # the tables come from `sw spark state migrate JOB` (or run once with --apply-state-migrations)
+    # the tables come from `streamwright state migrate --url URL` (or run once with --apply-state-migrations)
   platform:
     type: local
   spark:

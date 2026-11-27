@@ -59,7 +59,7 @@ RUN set -eux; \
 # example jobs' connectors declare in their pyproject.toml (keep them in step), plus the clients the examples use
 RUN set -eux; \
     python3 -m pip install --no-cache-dir --upgrade "pip>=24" "setuptools>=70" wheel; \
-    python3 -m pip install --no-cache-dir "pyyaml==6.0.2" "requests>=2.25,<3" "duckdb>=2.0,<2.1" \
+    python3 -m pip install --no-cache-dir "pyyaml==6.0.2" "requests>=2.25,<3" "duckdb>=2.0.1,<2.1" \
         "SQLAlchemy>=2.0,<3" pytz "sqlglot>=25" "confluent-kafka>=2.4" "psycopg[binary]>=3.1" boto3
 
 USER 185

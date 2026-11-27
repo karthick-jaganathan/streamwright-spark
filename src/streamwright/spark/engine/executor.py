@@ -24,6 +24,7 @@ Pinned reference rows, file plans and persisted frames retain their replay and c
 import itertools
 import json
 import logging
+import time
 
 from pyspark.storagelevel import StorageLevel
 
@@ -32,6 +33,7 @@ from streamwright.core.jobs.policy import SKIPPED, ExecutionPolicy, classify_tra
 from streamwright.core.jobs.refs import step_columns_used, walk_strings
 from streamwright.core.jobs.step_log import StepLog, log_step_rows
 from streamwright.core.runtime.logs.context import log_context
+from streamwright.core.runtime.logs.sql import log_statement
 from streamwright.spark.engine.runtime import StepRuntime
 from streamwright.spark.engine.session import resolve_driver_host
 from streamwright.spark.engine.sources import empty_frame, source_folder
@@ -205,7 +207,7 @@ class SparkExecutor:
             key = "apply_rows" if applies else "events"
             cap = limit(self.limits, key)
             with log_context(output=output["name"]):
-                rows = self.spark.sql(output["sql"], args=self.params).limit(cap + 1).collect()
+                rows = self._sql(output["sql"]).limit(cap + 1).collect()
                 if len(rows) > cap:
                     raise ValueError("%s output %s has more than %d rows (runtime.limits.%s)" % (
                         "apply" if applies else "event", output["name"], cap, key))
@@ -225,11 +227,22 @@ class SparkExecutor:
 
     # --- steps and outputs -----------------------------------------------------------------------------------
 
+    def _sql(self, text):
+        """A step's or output's DataFrame from its SQL (with the job's parameters), its line on streamwright.sql."""
+        start = time.perf_counter()
+        try:
+            frame = self.spark.sql(text, args=self.params)
+        except Exception as error:
+            log_statement("spark", text, time.perf_counter() - start, self.params, error=error, named=":")
+            raise
+        log_statement("spark", text, time.perf_counter() - start, self.params, named=":")
+        return frame
+
     def _step(self, rt, step):
         if step.get("source"):
             return self._source_step(rt, step)            # a source folder's stream, run on the driver
         if not step.get("connection"):
-            return self.spark.sql(step["sql"], args=self.params)
+            return self._sql(step["sql"])
         if self.connections.get(step["connection"]) is None:
             return self._source_call(rt, step)            # a source connector, run on the driver as a call step
         conn, adapter, method = self._resolve(step)
@@ -240,7 +253,7 @@ class SparkExecutor:
         )
         if step.get("sql"):
             frame.createOrReplaceTempView("input")  # a native read's own result is `input` for its sql
-            frame = self.spark.sql(step["sql"], args=self.params)
+            frame = self._sql(step["sql"])
             self.messages.createOrReplaceTempView("input")  # existing DataFrames keep their resolved plan
         return frame
 
@@ -278,7 +291,7 @@ class SparkExecutor:
                    else self.spark.createDataFrame(lines, "string").toDF("record"))
         records.createOrReplaceTempView(RECORDS_VIEW)
         try:
-            return self.spark.sql(step["sql"], args=self.params)
+            return self._sql(step["sql"])
         finally:
             self.spark.catalog.dropTempView(RECORDS_VIEW)   # the step's DataFrame keeps its resolved plan
 
@@ -337,7 +350,7 @@ class SparkExecutor:
 
     def _write(self, rt, out):
         conn, adapter, method = self._resolve(out)
-        frame = self.spark.sql(out["sql"], args=self.params)
+        frame = self._sql(out["sql"])
         return adapter.adapter.write(
             SparkContext(rt, out["name"], conn.auth), frame, method, out.get("arguments") or {}
         )

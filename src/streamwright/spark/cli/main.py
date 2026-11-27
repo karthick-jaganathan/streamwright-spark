@@ -26,10 +26,8 @@ import sys
 from types import MappingProxyType
 
 from streamwright.core.cli.help_format import DescriptionFormatter
-from streamwright.core.cli.job_state import job_id_from_job
-from streamwright.core.cli.jobs import JOB_OPTION, resolve_job
 from streamwright.core.jobs.state import StateError
-from streamwright.spark.cli import lock, run, state, validate
+from streamwright.spark.cli import lock, run, validate
 from streamwright.spark.cli.common import InputsError, add_job_arguments, err
 from streamwright.spark.cli.inputs import InputError
 from streamwright.spark.job import JobError
@@ -79,14 +77,11 @@ _COMMANDS = (
     ("run", "run a SparkJob: resume unfinished batches, then run new ones", {}, run.add_arguments, run.run),
     ("lock", "write or check the dependency lock file (package, Spark and JAR versions)", {"inputs": False},
      lock.add_arguments, lock.run),
-    ("state", "list, show, retry, abandon or purge a job's batches; its leases; migrate or check its state tables",
-     None,
-     state.add_arguments, state.run),
 )
 
 
 def build_parser():
-    """The `sw spark` argument parser (validate, plan, run, lock, state)."""
+    """The `sw spark` argument parser (validate, plan, run, lock)."""
     # no prefix matching: an unknown --log must not be taken for --log-level (Spark's level)
     raw = DescriptionFormatter
     parser = argparse.ArgumentParser(prog="sw spark", description=_DESCRIPTIONS["spark"], formatter_class=raw,
@@ -109,12 +104,6 @@ def _run_plan(args):
 
 
 def _normalize_job_args(args):
-    if getattr(args, "state_command", None):              # the shared state actions: core's JOB / --job
-        problem = job_id_from_job(args, getattr(args, JOB_OPTION, None))
-        if problem:
-            args.parser.error(problem)
-        resolve_job(args.parser, args)
-        return True
     if hasattr(args, "flag_job"):
         flag_val = args.flag_job
         if flag_val:
@@ -138,7 +127,7 @@ def _normalize_job_args(args):
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(sys.argv[1:] if argv is None else list(argv))
     if not getattr(args, "handler", None):
         parser.print_help()
         return 2
